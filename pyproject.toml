@@ -1,0 +1,16 @@
+[project]
+name = "illufly-docling"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "arcstep",email = "43801@qq.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
