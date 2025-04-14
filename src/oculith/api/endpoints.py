@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Uplo
 from pydantic import BaseModel, HttpUrl
 from fastapi.responses import JSONResponse, StreamingResponse
 from soulseal import TokenSDK
+from docling.datamodel.base_models import ConversionStatus
 
 # 直接导入ObservableConverter
 from ..core.converter import ObservableConverter
@@ -91,136 +92,6 @@ def mount_docling_service(
     async def get_converter():
         return app.state.converter
     
-    # 处理文档上传
-    @router.post("/process", response_class=JSONResponse)
-    async def process_document(
-        file: UploadFile = File(...),
-        output_format: str = Form("markdown"),
-        enable_remote_services: bool = Form(False),
-        do_ocr: bool = Form(False),
-        do_table_detection: bool = Form(False),
-        do_formula_detection: bool = Form(False),
-        enable_pic_description: bool = Form(False),
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter)
-    ):
-        """处理上传的文档"""
-        # 使用JWT中的用户ID
-        user_id = token_data["user_id"]
-        
-        # 日志记录用户信息，便于调试
-        logger.info(f"处理文档请求: 用户ID={user_id}, 用户信息={token_data}")
-        
-        try:
-            # 创建临时文件
-            temp_dir = Path(os.path.join(tempfile.gettempdir(), "illufly_docling_uploads"))
-            temp_dir.mkdir(exist_ok=True, parents=True)
-            
-            # 生成带用户ID的文件名，避免冲突
-            temp_file = temp_dir / f"{user_id}_{int(time.time())}_{file.filename}"
-            
-            # 保存上传的文件
-            content = await file.read()
-            with open(temp_file, "wb") as f:
-                f.write(content)
-                
-            logger.info(f"文件已保存到临时位置: {temp_file}, 大小: {len(content)} 字节")
-            
-            # 创建文档状态跟踪器
-            doc_id = f"doc_{user_id}_{int(time.time())}"
-            status_tracker = DocumentProcessStatus(doc_id=doc_id)
-            
-            # 创建SSE响应
-            async def event_generator():
-                try:
-                    # 开始处理文档
-                    async for update in converter.convert_async(
-                        source=str(temp_file),
-                        doc_id=doc_id,
-                        status_tracker=status_tracker
-                    ):
-                        # 将更新转换为SSE事件格式
-                        yield f"data: {json.dumps(update)}\n\n"
-                        
-                        # 如果处理完成或失败，退出循环
-                        if update["stage"] in ["completed", "error"]:
-                            break
-                
-                finally:
-                    # 清理临时文件
-                    try:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                            logger.debug(f"已删除临时文件: {temp_file}")
-                    except Exception as e:
-                        logger.warning(f"删除临时文件 {temp_file} 失败: {e}")
-            
-            # 返回SSE响应
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream"
-            )
-            
-        except Exception as e:
-            import traceback
-            logger.error(f"处理文档时出错: {e}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    # 处理URL
-    @router.post("/process-url", response_class=JSONResponse)
-    async def process_url(
-        request: ProcessUrlRequest,
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter)
-    ):
-        """处理URL指向的文档"""
-        # 使用JWT中的用户ID
-        user_id = token_data["user_id"]
-        
-        # 日志记录用户信息，便于调试
-        logger.info(f"处理URL请求: 用户ID={user_id}, URL={request.url}")
-        
-        try:
-            # 创建文档状态跟踪器
-            doc_id = f"doc_{user_id}_{int(time.time())}"
-            status_tracker = DocumentProcessStatus(doc_id=doc_id)
-            
-            # 创建SSE响应
-            async def event_generator():
-                try:
-                    # 开始处理URL指向的文档
-                    async for update in converter.convert_async(
-                        source=str(request.url),
-                        doc_id=doc_id,
-                        status_tracker=status_tracker
-                    ):
-                        # 将更新转换为SSE事件格式
-                        yield f"data: {json.dumps(update)}\n\n"
-                        
-                        # 如果处理完成或失败，退出循环
-                        if update["stage"] in ["completed", "error"]:
-                            break
-                except Exception as e:
-                    # 处理错误，发送错误事件
-                    error_event = {
-                        "stage": "error",
-                        "message": f"处理URL文档时出错: {str(e)}",
-                        "error": str(e),
-                        "progress": 1.0,
-                        "doc_id": doc_id
-                    }
-                    yield f"data: {json.dumps(error_event)}\n\n"
-            
-            # 返回SSE响应
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream"
-            )
-            
-        except Exception as e:
-            import traceback
-            logger.error(f"处理URL时出错: {e}\n{traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=str(e))
     
     # 获取支持的格式
     @router.get("/formats")
@@ -249,6 +120,137 @@ def mount_docling_service(
             "allowed_formats": [fmt.value for fmt in app.state.converter.allowed_formats],
             "description": "文档处理服务"
         }
+    
+    
+    # 上传并转换 - 简化上传文件并返回markdown结果
+    @router.post("/upload/convert", response_class=JSONResponse)
+    async def upload_and_convert(
+        file: UploadFile = File(...),
+        token_data: Dict[str, Any] = Depends(verify_token),
+        converter: ObservableConverter = Depends(get_converter)
+    ):
+        """上传文件并直接转换为Markdown"""
+        user_id = token_data["user_id"]
+        logger.info(f"上传并转换请求: 用户ID={user_id}, 文件名={file.filename}")
+        
+        try:
+            # 保存上传文件到临时位置
+            temp_dir = Path(os.path.join(tempfile.gettempdir(), "illufly_docling_uploads"))
+            temp_dir.mkdir(exist_ok=True, parents=True)
+            temp_file = temp_dir / f"{user_id}_{int(time.time())}_{file.filename}"
+            
+            content = await file.read()
+            with open(temp_file, "wb") as f:
+                f.write(content)
+            
+            try:
+                # 同步转换文档
+                result = converter.convert(source=str(temp_file))
+                
+                # 处理结果
+                if result.status == ConversionStatus.SUCCESS and result.document:
+                    # 导出为Markdown
+                    markdown_content = result.document.export_to_markdown()
+                    return {
+                        "success": True,
+                        "content": markdown_content,
+                        "content_type": "text/markdown"
+                    }
+                else:
+                    # 处理失败
+                    error_msg = f"转换失败: {result.status}"
+                    if hasattr(result, 'errors') and result.errors:
+                        error_msg = str(result.errors[0])
+                    
+                    raise HTTPException(status_code=500, detail=error_msg)
+            finally:
+                # 清理临时文件
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        logger.warning(f"删除临时文件失败: {e}")
+        except Exception as e:
+            logger.error(f"上传并转换失败: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 本地文件转换 - 指定路径并返回markdown结果
+    @router.post("/local/convert", response_class=JSONResponse)
+    async def local_convert(
+        path: str = Form(...),
+        token_data: Dict[str, Any] = Depends(verify_token),
+        converter: ObservableConverter = Depends(get_converter)
+    ):
+        """转换本地文件路径为Markdown"""
+        user_id = token_data["user_id"]
+        logger.info(f"本地转换请求: 用户ID={user_id}, 路径={path}")
+        
+        # 验证文件存在
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+        
+        try:
+            # 同步转换文档
+            result = converter.convert(source=path)
+            
+            # 处理结果
+            if result.status == ConversionStatus.SUCCESS and result.document:
+                # 导出为Markdown
+                markdown_content = result.document.export_to_markdown()
+                return {
+                    "success": True,
+                    "content": markdown_content,
+                    "content_type": "text/markdown"
+                }
+            else:
+                # 处理失败
+                error_msg = f"转换失败: {result.status}"
+                if hasattr(result, 'errors') and result.errors:
+                    error_msg = str(result.errors[0])
+                
+                raise HTTPException(status_code=500, detail=error_msg)
+        except Exception as e:
+            logger.error(f"本地转换失败: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # 远程文件转换 - 指定URL并返回markdown结果
+    @router.post("/remote/convert", response_class=JSONResponse)
+    async def remote_convert(
+        url: str = Form(...),
+        token_data: Dict[str, Any] = Depends(verify_token),
+        converter: ObservableConverter = Depends(get_converter)
+    ):
+        """转换远程URL为Markdown"""
+        user_id = token_data["user_id"]
+        logger.info(f"远程转换请求: 用户ID={user_id}, URL={url}")
+        
+        # 验证URL格式
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="无效的URL格式")
+        
+        try:
+            # 同步转换文档
+            result = converter.convert(source=url)
+            
+            # 处理结果
+            if result.status == ConversionStatus.SUCCESS and result.document:
+                # 导出为Markdown
+                markdown_content = result.document.export_to_markdown()
+                return {
+                    "success": True,
+                    "content": markdown_content,
+                    "content_type": "text/markdown"
+                }
+            else:
+                # 处理失败
+                error_msg = f"转换失败: {result.status}"
+                if hasattr(result, 'errors') and result.errors:
+                    error_msg = str(result.errors[0])
+                
+                raise HTTPException(status_code=500, detail=error_msg)
+        except Exception as e:
+            logger.error(f"远程转换失败: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
     
     # 注册路由
     app.include_router(router, prefix=prefix)

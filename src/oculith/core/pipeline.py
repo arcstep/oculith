@@ -11,6 +11,7 @@ from typing import Dict, Any, Optional, Callable, AsyncGenerator, Union, List, T
 from pathlib import Path
 from functools import partial
 from copy import deepcopy
+import json
 
 # 从官方docling导入
 from docling.pipeline.base_pipeline import BasePipeline
@@ -131,7 +132,7 @@ class ObservablePipelineWrapper:
                 if hasattr(conv_res, 'document') and conv_res.document:
                     # 尝试提取文本内容
                     try:
-                        text_content = conv_res.document.export_to_text()
+                        text_content = conv_res.document.export_to_markdown()
                         if text_content:
                             self.intermediate_results["current_text"] = text_content
                     except Exception as e:
@@ -358,15 +359,7 @@ class ObservablePipelineWrapper:
             self.stop_monitoring()
     
     async def execute_async(self, in_doc: InputDocument, raises_on_error: bool = True) -> AsyncGenerator[Dict[str, Any], None]:
-        """异步执行文档处理并产生状态更新
-        
-        Args:
-            in_doc: 输入文档
-            raises_on_error: 错误时是否抛出异常
-            
-        Yields:
-            状态更新和处理结果
-        """
+        """异步执行文档处理并产生状态更新"""
         # 初始化中间结果
         if hasattr(in_doc, 'page_count') and in_doc.page_count:
             self.intermediate_results["total_pages"] = in_doc.page_count
@@ -407,18 +400,45 @@ class ObservablePipelineWrapper:
             # 产生最终状态
             if result.status == ConversionStatus.SUCCESS:
                 self._log_progress(DocumentProcessStage.COMPLETE, 1.0, "文档处理完成")
+                
+                # 提取文档内容
+                markdown_content = ""
+                if result.document:
+                    try:
+                        # 尝试导出为Markdown
+                        markdown_content = result.document.export_to_markdown()
+                    except Exception as e:
+                        logger.warning(f"导出为Markdown失败: {str(e)}")
+                
+                # 返回成功状态
+                yield self.status_tracker.to_dict()
+                
+                # 返回处理结果，包含Markdown文本
+                yield {
+                    "type": "result",
+                    "result_status": str(result.status),
+                    "success": True,
+                    "content": markdown_content,
+                    "content_type": "text/markdown",
+                    "format": "markdown",
+                }
             else:
                 error_msg = f"文档处理失败: {result.status}"
                 self._log_progress(DocumentProcessStage.ERROR, 1.0, error_msg)
                 
-            yield self.status_tracker.to_dict()
-            
-            # 返回处理结果
-            yield {
-                "type": "result",
-                "result": result
-            }
-            
+                # 返回错误状态
+                yield self.status_tracker.to_dict()
+                
+                # 返回失败结果
+                yield {
+                    "type": "result",
+                    "result_status": str(result.status),
+                    "success": False,
+                    "errors": [str(err) for err in (result.errors or [])],
+                    "content": "",
+                    "content_type": "text/markdown",
+                    "format": "markdown",
+                }
         except Exception as e:
             error = e
             error_msg = f"文档处理过程中出现异常: {str(e)}"
