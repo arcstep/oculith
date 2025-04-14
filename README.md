@@ -1,246 +1,130 @@
-# illufly-docling
+# Oculith 文档处理工具
 
 ## 简介
 
-illufly-docling是一个强大的文档处理服务，基于docling技术实现，提供了文档转换、处理和分析功能。支持PDF、Word、HTML等多种格式的文档处理，并可作为独立服务或集成到其他应用中使用。
+Oculith 是一个强大的文档处理工具，可以将多种格式的文档（如PDF、Word、HTML等）转换为Markdown等结构化格式。它既可以作为独立服务运行，也可以集成到你的应用中。
 
-## 特点
+## 功能特点
 
-- 支持多种文档格式（PDF、Word、HTML等）
-- 提供命令行工具、MCP服务和API接口
-- 支持OCR文字识别、表格检测、公式识别
-- 可观测的转换过程，实时获取处理进度
-- 易于集成到现有应用中
+- 支持多种文档格式（PDF、Word、HTML、图片等）
+- 文档转换为Markdown、文本等格式
+- 支持OCR文字识别和表格检测
+- 可通过API接口集成到其他应用
+- 简单易用的文件管理功能
 
-## 安装
-
-### 通过pip安装
+## 安装方法
 
 ```bash
-pip install illufly-docling
+pip install oculith
 ```
 
-### 从源码安装
+## 快速开始
+
+### 作为服务启动
+
+最简单的方式是直接运行Oculith服务：
 
 ```bash
-git clone https://github.com/your-org/illufly-docling.git
-cd illufly-docling
-pip install -e .
+python -m oculith
 ```
 
-## 使用方法
-
-### 命令行工具
-
-illufly-docling提供了三种运行模式：
-
-#### 1. 处理文档模式
-
-直接处理文档文件或URL，转换为指定格式：
+这将在默认端口(31573)启动服务。你可以通过以下选项自定义：
 
 ```bash
-# 基本用法
-python -m illufly_docling process 文档路径.pdf -f markdown
+# 指定端口
+python -m oculith --port 8080
 
-# 指定输出文件
-python -m illufly_docling process 文档路径.docx -f html -o 输出路径.html
+# 指定允许的文档格式
+python -m oculith --allowed-formats pdf,docx,html
 
-# 启用高级功能
-python -m illufly_docling process 文档路径.pdf -f markdown --ocr --tables --formulas
+# 指定输出目录
+python -m oculith --output-dir ./文档输出
 ```
 
-#### 2. 服务器模式
+### API使用方法
 
-以MCP服务器模式运行：
+服务启动后，你可以通过以下API进行文档处理：
+
+#### 1. 上传并转换文档
+
+```
+POST /oculith/upload/convert
+```
+
+使用表单提交：
+- `file`: 要上传的文件
+- `title`: 可选的文档标题
+- `description`: 可选的文档描述
+- `tags`: 可选的标签列表
+
+#### 2. 转换本地文件
+
+```
+POST /oculith/local/convert
+```
+
+提交参数：
+- `path`: 本地文件的完整路径
+
+#### 3. 转换远程URL文件
+
+```
+POST /oculith/remote/convert
+```
+
+提交参数：
+- `url`: 远程文件的URL地址
+
+#### 4. 获取支持的格式
+
+```
+GET /oculith/formats
+```
+
+#### 5. 获取文件列表
+
+```
+GET /oculith/files
+```
+
+## 文件管理功能
+
+Oculith 还提供了简单的文件管理功能：
+
+- 上传文件：`POST /oculith/local/upload`
+- 获取文件信息：`GET /oculith/files/{file_id}`
+- 获取文件内容：`GET /oculith/files/{file_id}/content`
+- 更新文件元数据：`PATCH /oculith/files/{file_id}`
+- 删除文件：`DELETE /oculith/files/{file_id}`
+- 下载文件：`GET /oculith/files/{file_id}/download`
+
+## 使用示例
+
+### 使用curl上传并转换文档
 
 ```bash
-# 使用stdio传输（默认）
-python -m illufly_docling server
-
-# 使用SSE传输（HTTP）
-python -m illufly_docling server --transport sse --port 8000
+curl -X POST "http://localhost:31573/oculith/upload/convert" \
+  -H "Authorization: Bearer 你的令牌" \
+  -F "file=@/路径/文档.pdf" \
+  -F "title=测试文档" \
+  -F "description=这是一个测试文档"
 ```
 
-#### 3. API模式
-
-启动FastAPI测试服务，提供Web API接口：
+### 转换本地文件
 
 ```bash
-python -m illufly_docling api --port 8080
-```
-
-API服务启动后，可通过浏览器访问`http://localhost:8080/docs`查看API文档。
-
-### 在应用中集成
-
-#### 使用异步客户端
-
-```python
-from illufly_docling.mcp_client import DoclingMcpClient
-
-async def process_document():
-    # 创建客户端（默认使用子进程方式）
-    client = DoclingMcpClient(user_id="my_user")
-    
-    try:
-        # 处理本地文件
-        result = await client.process_document_binary(
-            file_path="文档路径.pdf",
-            output_format="markdown"
-        )
-        
-        # 处理URL
-        result = await client.process_document_url(
-            url="https://example.com/document.pdf",
-            output_format="html"
-        )
-        
-        # 获取支持的格式
-        formats = await client.get_supported_formats()
-        
-    finally:
-        # 关闭客户端
-        await client.close()
-```
-
-#### 使用同步客户端
-
-```python
-from illufly_docling.mcp_client import SyncDoclingMcpClient
-
-# 使用上下文管理器自动关闭连接
-with SyncDoclingMcpClient(user_id="my_user") as client:
-    # 处理本地文件
-    result = client.process_document_binary(
-        file_path="文档路径.pdf",
-        output_format="markdown"
-    )
-    
-    # 获取支持的格式
-    formats = client.get_supported_formats()
-```
-
-#### 集成到FastAPI应用
-
-```python
-from fastapi import FastAPI, Depends
-from illufly_docling.endpoints import mount_docling_service
-
-app = FastAPI()
-
-# 定义获取用户的函数
-async def get_current_user():
-    # 这里应该是您的用户认证逻辑
-    return {"user_id": "default_user"}
-
-# 挂载文档处理服务 - 使用子进程方式（推荐）
-client = mount_docling_service(
-    app=app,
-    require_user=get_current_user,
-    use_stdio=True,
-    prefix="/api/docs"
-)
-
-# 或者连接到已运行的MCP服务
-client = mount_docling_service(
-    app=app,
-    require_user=get_current_user,
-    use_stdio=False,
-    host="localhost",
-    port=8000,
-    prefix="/api/docs"
-)
-```
-
-集成后，您的FastAPI应用将拥有以下端点：
-- `POST /api/docs/process` - 处理上传的文档
-- `POST /api/docs/process-url` - 处理URL指向的文档
-- `GET /api/docs/formats` - 获取支持的文档格式
-
-## 配置选项
-
-### 文档处理选项
-
-- `output_format` - 输出格式 (markdown, text, html, json)
-- `enable_remote_services` - 是否启用远程服务
-- `do_ocr` - 是否启用OCR
-- `do_table_detection` - 是否启用表格检测
-- `do_formula_detection` - 是否启用公式检测
-- `enable_pic_description` - 是否启用图片描述
-- `backend_choice` - 后端选择 (stable, standard, auto)
-- `use_original_converter` - 是否使用原始转换器
-
-### 日志选项
-
-- `verbose` - 是否输出详细日志
-- `quiet` - 是否仅输出错误日志
-
-## 示例
-
-### 处理PDF文档并提取为Markdown
-
-```python
-import asyncio
-from illufly_docling.mcp_client import DoclingMcpClient
-
-async def process_pdf():
-    client = DoclingMcpClient()
-    try:
-        result = await client.process_document_binary(
-            file_path="sample.pdf",
-            output_format="markdown"
-        )
-        
-        if result["success"]:
-            print("处理成功!")
-            # 获取处理结果
-            content = result["result"].get("content", "")
-            print(f"提取内容: {content[:200]}...")
-        else:
-            print(f"处理失败: {result.get('error', '未知错误')}")
-            
-    finally:
-        await client.close()
-
-# 运行异步函数
-asyncio.run(process_pdf())
-```
-
-### 启动MCP服务器并连接客户端
-
-```python
-# 启动服务器 (在单独的终端运行)
-# python -m illufly_docling server --transport sse --port 8000
-
-# 客户端连接
-from illufly_docling.mcp_client import SyncDoclingMcpClient
-
-# 连接到SSE服务器
-client = SyncDoclingMcpClient(
-    use_stdio=False,
-    host="localhost",
-    port=8000
-)
-
-try:
-    # 获取支持的格式
-    formats = client.get_supported_formats()
-    print(f"支持的格式: {formats}")
-    
-    # 处理文件
-    result = client.process_document_path(
-        file_path="document.docx",
-        output_format="text"
-    )
-    print(result)
-    
-finally:
-    client.close()
+curl -X POST "http://localhost:31573/oculith/local/convert" \
+  -H "Authorization: Bearer 你的令牌" \
+  -F "path=/绝对路径/文档.pdf"
 ```
 
 ## 注意事项
 
-- 确保已安装所有依赖，包括mcp包和docling相关组件
-- 使用SSE模式需要确保网络端口可访问
-- 处理大型文档时可能需要更多内存和处理时间
-- 临时文件存储在`/tmp/illufly-docling-uploads`目录下
+- 第一次使用时需要设置环境变量 `FASTAPI_SECRET_KEY` 作为认证密钥
+- 对于大文件处理，可能需要更长的处理时间
+- 默认情况下，每个用户的存储限制为200MB
+- 临时文件会存储在系统临时目录中
+
+## 更多帮助
+
+启动服务后，你可以访问 `http://localhost:31573/docs` 获取完整的API文档。
