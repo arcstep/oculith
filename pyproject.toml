@@ -1,16 +1,33 @@
 [project]
-name = "illufly-docling"
-version = "0.1.0"
-description = ""
+name = "oculith"
+version = "0.1.1"
+description = "Document OCR based on docling"
 authors = [
     {name = "arcstep",email = "43801@qq.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
+    "fastapi>=0.68.0",
+    "uvicorn>=0.15.0",
+    "python-multipart>=0.0.5",
+    "pydantic>=1.8.2",
+    "python-dotenv>=0.19.0",
+    "loguru>=0.5.3",
+    "voidring>=0.1.0",
+    "soulseal (>=0.1.8,<0.2.0)",
+    "torch (>=2.0.0,<2.3)",
+    "docling>=2.30.0",
 ]
-
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+packages = [
+    { include = "oculith", from = "src" }
+]
+
+[tool.poetry.scripts]
+oculith = "oculith.__main__:main"
