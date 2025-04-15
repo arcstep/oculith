@@ -24,6 +24,7 @@ from docling.document_converter import (
 )
 from docling.datamodel.settings import DocumentLimits, PageRange, DEFAULT_PAGE_RANGE
 from docling.exceptions import ConversionError
+from docling.chunking import HybridChunker
 
 # 导入自定义组件
 from .schemas import DocumentProcessStage, DocumentProcessStatus
@@ -327,7 +328,10 @@ class ObservableConverter:
                 return
             
             # 执行异步处理并产生更新
+            pipeline_update_count = 0
             async for update in observable_pipeline.execute_async(in_doc, raises_on_error):
+                pipeline_update_count += 1
+                logger.info(f"从pipeline获取第{pipeline_update_count}个更新: 类型={type(update)}, 键={list(update.keys())}")
                 yield update
                 
         except Exception as e:
@@ -424,9 +428,18 @@ class ObservableConverter:
         max_num_pages: int = sys.maxsize,
         max_file_size: int = sys.maxsize,
         page_range: PageRange = DEFAULT_PAGE_RANGE,
+        retriever: Optional[Any] = None
     ) -> Dict[str, Any]:
         """转换文档并保存结果"""
-        result = await self.convert_async(
+        # 存储所有更新
+        all_updates = []
+        doc_result = None
+        update_count = 0
+        
+        # 记录开始转换
+        logger.info(f"开始转换并保存文档: source={source}, user_id={user_id}, file_id={file_id}")
+        
+        async for update in self.convert_async(
             source=source,
             doc_id=doc_id,
             headers=headers,
@@ -434,38 +447,95 @@ class ObservableConverter:
             max_num_pages=max_num_pages,
             max_file_size=max_file_size,
             page_range=page_range
-        )
-        
-        if result["status"] == ConversionStatus.SUCCESS and result["document"] and self.files_service:
-            # 转换成功且提供了FileService
-            markdown_content = result["document"].export_to_markdown()
+        ):
+            update_count += 1
+            # 记录每个更新的基本信息
+            logger.info(f"收到第{update_count}个更新: 类型={type(update)}, 包含键={list(update.keys())}")
             
-            # 保存为markdown文件并关联
-            if self.files_service:
-                md_file = await self.files_service.save_markdown_file(
-                    user_id=user_id,
-                    source_file_id=file_id,
-                    markdown_content=markdown_content,
-                    metadata={
-                        "converted": True,
-                        "conversion_status": str(result["status"]),
-                        "conversion_time": time.time()
-                    }
-                )
-                
-                # 同时更新源文件元数据
-                await self.files_service.update_metadata(user_id, file_id, {
-                    "converted": True,
-                    "conversion_status": str(result["status"]),
-                    "conversion_time": time.time(),
-                    "markdown_file_id": md_file["id"]
-                })
-                
-                return {
-                    "success": True,
-                    "file_id": file_id,
-                    "markdown_file_id": md_file["id"],
-                    "content": markdown_content
-                }
+            all_updates.append(update)
+            # 特别寻找包含文档对象的更新
+            if "document" in update:
+                logger.info(f"找到包含document的更新: stage={update.get('stage')}, type={type(update['document'])}")
+                doc_result = update
         
-        # 处理失败情况... 
+        # 记录处理结果
+        logger.info(f"处理完成: 共收到{update_count}个更新, 找到document对象: {doc_result is not None}")
+        
+        if doc_result and "document" in doc_result:
+            # 提取文档对象
+            document = doc_result["document"]
+            logger.info(f"成功提取document对象，类型: {type(document)}")
+            
+            # 转换为markdown
+            markdown_content = document.export_to_markdown()
+            
+            # 保存为markdown文件并更新元数据
+            md_file = await self.files_service.save_markdown_file(
+                user_id=user_id,
+                file_id=file_id,
+                markdown_content=markdown_content,
+                metadata={
+                    "conversion_status": doc_result.get("status", "SUCCESS")
+                }
+            )
+            
+            # 对文档进行切片
+            chunks = self.chunk_document(document)
+            
+            # 保存切片
+            chunks_info = await self.files_service.save_chunks(
+                user_id=user_id,
+                file_id=file_id,
+                chunks=chunks
+            )
+            
+            # 如果提供了检索器，则添加切片到向量库
+            if retriever:
+                # 遍历所有切片
+                async for chunk_data in self.files_service.iter_chunks_content(user_id, file_id):
+                    try:
+                        # 添加到向量库
+                        await retriever.add(
+                            texts=chunk_data["content"],
+                            user_id=user_id,
+                            metadatas=chunk_data["metadata"]
+                        )
+                    except Exception as e:
+                        logger.error(f"向量化切片失败: {str(e)}")
+            
+            # 返回成功结果
+            return {
+                "success": True,
+                "file_id": file_id,
+                "content": markdown_content,
+                "chunks_count": len(chunks)
+            }
+        
+        # 处理失败情况
+        return {
+            "success": False,
+            "error": "转换失败" if doc_result else "未获得转换结果"
+        }
+
+    def chunk_document(self, document) -> List[Dict[str, Any]]:
+        """对文档进行切片
+        
+        Args:
+            document: docling 文档对象
+            
+        Returns:
+            List[Dict[str, Any]]: 切片列表，每个切片包含原始文本和富集文本
+        """
+        chunker = HybridChunker()
+        chunks = []
+        
+        # 对文档进行切片
+        for i, chunk in enumerate(chunker.chunk(dl_doc=document)):
+            enriched_text = chunker.serialize(chunk=chunk)
+            chunks.append({
+                "index": i,
+                "text": chunk.text,
+                "enriched_text": enriched_text
+            })
+        
+        return chunks

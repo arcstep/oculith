@@ -9,10 +9,14 @@ from .schemas import DocumentProcessStage, DocumentProcessStatus
 from .pipeline import ObservablePipelineWrapper
 from .converter import ObservableConverter
 from .litellm import LiteLLM, init_litellm
+from .retriever import ChromaRetriever
 
 __all__ = [
     'DocumentProcessStage',
     'DocumentProcessStatus',
     'ObservablePipelineWrapper',
     'ObservableConverter',
+    'LiteLLM',
+    'init_litellm',
+    'ChromaRetriever',
 ]

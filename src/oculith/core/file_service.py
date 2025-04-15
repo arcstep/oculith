@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from pathlib import Path
 import os
 import shutil
@@ -22,8 +22,10 @@ class FileStatus:
 class FilesService:
     """文件管理服务
     
-    按用户分目录存储文件，提供上传、下载、删除和列表查询功能。
-    支持元数据管理、文件处理和流式下载。
+    基于约定的文件组织结构：
+    - {user_id}/raw/{file_id} - 原始文件
+    - {user_id}/md/{file_id} - Markdown文件
+    - {user_id}/chunks/{file_id}/ - 切片目录
     """
     
     def __init__(
@@ -33,40 +35,28 @@ class FilesService:
         max_total_size_per_user: int = 200 * 1024 * 1024,  # 默认200MB
         allowed_extensions: List[str] = None
     ):
-        """初始化文件管理服务
-        
-        Args:
-            base_dir: 文件存储根目录
-            max_file_size: 单个文件最大大小（字节），默认50MB
-            max_total_size_per_user: 每个用户允许的最大存储总大小，默认200MB
-            allowed_extensions: 允许的文件扩展名列表，默认为None表示允许所有扩展名
-        """
+        """初始化文件管理服务"""
         self.base_dir = Path(base_dir)
-        self.files_dir = self.base_dir / "files"
         self.meta_dir = self.base_dir / "meta"
         self.temp_dir = self.base_dir / "temp"
         
-        # 创建目录
+        # 创建基础目录
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.files_dir.mkdir(parents=True, exist_ok=True)
         self.meta_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
         self.max_file_size = max_file_size
         self.max_total_size_per_user = max_total_size_per_user
         self.allowed_extensions = allowed_extensions or [
-            '.ppt', '.pptx',
-            '.rmd', '.md', '.mdx', '.markdown',
-            '.pdf', '.doc', '.docx', '.txt',
-            '.jpg', '.jpeg', '.png', '.gif', '.webp',
-            '.csv', '.xlsx', '.xls',
-            '.mp3', '.wav', '.mp4', '.avi', '.mov'
+            '.pptx',
+            '.md', '.markdown',
+            '.pdf', '.docx', '.txt',
+            '.jpg', '.jpeg', '.png', '.gif', '.webp'
         ]
         
         # 文件MIME类型映射
         self._mime_types = {
             '.pdf': 'application/pdf',
-            '.doc': 'application/msword',
             '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             '.txt': 'text/plain',
             '.md': 'text/markdown',
@@ -75,185 +65,74 @@ class FilesService:
             '.jpeg': 'image/jpeg',
             '.png': 'image/png',
             '.gif': 'image/gif',
-            '.webp': 'image/webp',
-            '.csv': 'text/csv',
-            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            '.xls': 'application/vnd.ms-excel',
-            '.zip': 'application/zip',
-            '.rar': 'application/x-rar-compressed',
-            '.7z': 'application/x-7z-compressed',
-            '.mp3': 'audio/mpeg',
-            '.wav': 'audio/wav',
-            '.mp4': 'video/mp4',
-            '.avi': 'video/x-msvideo',
-            '.mov': 'video/quicktime',
+            '.webp': 'image/webp'
         }
     
-    def get_user_files_dir(self, user_id: str) -> Path:
-        """获取用户文件目录
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            用户文件目录路径
-        """
-        user_dir = self.files_dir / user_id
+    # 新的目录管理函数
+    def get_user_raw_dir(self, user_id: str) -> Path:
+        """获取用户原始文件目录"""
+        user_dir = self.base_dir / user_id / "raw"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir
+    
+    def get_user_md_dir(self, user_id: str) -> Path:
+        """获取用户Markdown文件目录"""
+        user_dir = self.base_dir / user_id / "md"
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir
+    
+    def get_user_chunks_dir(self, user_id: str) -> Path:
+        """获取用户切片目录"""
+        user_dir = self.base_dir / user_id / "chunks"
         user_dir.mkdir(parents=True, exist_ok=True)
         return user_dir
     
     def get_user_meta_dir(self, user_id: str) -> Path:
-        """获取用户元数据目录
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            用户元数据目录路径
-        """
-        user_meta_dir = self.meta_dir / user_id
+        """获取用户元数据目录"""
+        user_meta_dir = self.base_dir / user_id / "meta"
         user_meta_dir.mkdir(parents=True, exist_ok=True)
         return user_meta_dir
     
     def get_user_temp_dir(self, user_id: str) -> Path:
-        """获取用户临时文件目录
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            用户临时文件目录路径
-        """
+        """获取用户临时文件目录"""
         user_temp_dir = self.temp_dir / user_id
         user_temp_dir.mkdir(parents=True, exist_ok=True)
         return user_temp_dir
     
-    def get_file_path(self, user_id: str, file_id: str) -> Path:
-        """获取文件路径
-        
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            
-        Returns:
-            文件路径
-        """
-        return self.get_user_files_dir(user_id) / file_id
+    # 根据类型获取文件路径
+    def get_raw_file_path(self, user_id: str, file_id: str) -> Path:
+        """获取原始文件路径"""
+        return self.get_user_raw_dir(user_id) / file_id
+    
+    def get_md_file_path(self, user_id: str, file_id: str) -> Path:
+        """获取Markdown文件路径"""
+        return self.get_user_md_dir(user_id) / f"{file_id}.md"
+    
+    def get_chunks_dir_path(self, user_id: str, file_id: str) -> Path:
+        """获取切片目录路径"""
+        chunks_dir = self.get_user_chunks_dir(user_id) / file_id
+        chunks_dir.mkdir(exist_ok=True)
+        return chunks_dir
     
     def get_metadata_path(self, user_id: str, file_id: str) -> Path:
-        """获取文件元数据路径
-        
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            
-        Returns:
-            文件元数据路径
-        """
+        """获取文件元数据路径"""
         return self.get_user_meta_dir(user_id) / f"{file_id}.json"
     
-    def generate_file_id(self, original_filename: str) -> str:
-        """生成文件ID
-        
-        Args:
-            original_filename: 原始文件名
-            
-        Returns:
-            文件ID，格式为：uuid + 文件扩展名
-        """
-        _, ext = os.path.splitext(original_filename)
-        return f"{uuid.uuid4().hex}{ext.lower()}"
+    def generate_file_id(self, original_filename: str = None) -> str:
+        """生成文件ID"""
+        if original_filename:
+            _, ext = os.path.splitext(original_filename)
+            return f"{uuid.uuid4().hex}{ext.lower()}"
+        return uuid.uuid4().hex
     
-    def is_valid_file_type(self, file_name: str) -> bool:
-        """检查文件类型是否有效
-        
-        Args:
-            file_name: 文件名
-            
-        Returns:
-            文件类型是否有效
-        """
-        _, ext = os.path.splitext(file_name)
-        return ext.lower() in self.allowed_extensions
-    
-    def get_file_extension(self, file_name: str) -> str:
-        """获取文件扩展名
-        
-        Args:
-            file_name: 文件名
-            
-        Returns:
-            文件扩展名，如 '.pdf', '.doc'
-        """
-        _, ext = os.path.splitext(file_name)
-        return ext.lower()
-    
-    def get_file_type(self, file_name: str) -> str:
-        """获取文件类型
-        
-        Args:
-            file_name: 文件名
-            
-        Returns:
-            文件类型，如 'pdf', 'doc', 'docx', 'txt'
-        """
-        _, ext = os.path.splitext(file_name)
-        return ext.lower()[1:]  # 去掉点号
-    
-    def get_file_mimetype(self, file_name: str) -> str:
-        """获取文件MIME类型
-        
-        Args:
-            file_name: 文件名
-            
-        Returns:
-            文件MIME类型
-        """
-        _, ext = os.path.splitext(file_name)
-        mime_type = self._mime_types.get(ext.lower())
-        if not mime_type:
-            # 使用系统mimetypes库猜测
-            mime_type = mimetypes.guess_type(file_name)[0]
-        return mime_type or 'application/octet-stream'
-    
-    async def calculate_user_storage_usage(self, user_id: str) -> int:
-        """计算用户已使用的存储空间（只计算物理存在的文件）
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            已使用的字节数
-        """
-        total_size = 0
-        user_files_dir = self.get_user_files_dir(user_id)
-        
-        # 直接遍历用户文件目录，计算所有文件大小
-        for file_path in user_files_dir.glob("*"):
-            if file_path.is_file():
-                total_size += file_path.stat().st_size
-        
-        return total_size
-    
+    # 修改保存文件方法以适应新结构
     async def save_file(
         self, 
         user_id: str, 
         file: UploadFile,
         metadata: Dict[str, Any] = None
     ) -> Dict[str, Any]:
-        """保存文件
-        
-        Args:
-            user_id: 用户ID
-            file: 上传的文件
-            metadata: 额外的元数据
-            
-        Returns:
-            文件信息，包含ID、原始文件名、大小等
-            
-        Raises:
-            ValueError: 文件大小超过限制、文件类型不支持或用户存储空间不足
-        """
+        """保存上传的文件到原始文件目录"""
         # 检查文件类型
         if not self.is_valid_file_type(file.filename):
             raise ValueError(f"不支持的文件类型: {file.filename}")
@@ -263,7 +142,7 @@ class FilesService:
         
         # 生成文件ID和路径
         file_id = self.generate_file_id(file.filename)
-        file_path = self.get_file_path(user_id, file_id)
+        file_path = self.get_raw_file_path(user_id, file_id)
         meta_path = self.get_metadata_path(user_id, file_id)
         
         # 保存文件
@@ -290,10 +169,13 @@ class FilesService:
             "size": file_size,
             "type": self.get_file_type(file.filename),
             "extension": self.get_file_extension(file.filename),
-            "path": str(file_path),
+            "source_type": "local",  # 标记为本地上传文件
             "created_at": time.time(),
             "updated_at": time.time(),
             "status": FileStatus.ACTIVE,
+            "converted": False,
+            "has_markdown": False,
+            "has_chunks": False
         }
         
         # 添加额外元数据
@@ -306,123 +188,293 @@ class FilesService:
         
         return file_info
     
-    async def get_file(self, user_id: str, file_id: str) -> Optional[Dict[str, Any]]:
-        """获取文件信息
-        
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            
-        Returns:
-            文件信息，如果文件不存在则返回None
-        """
+    # 添加新方法用于远程URL资源
+    async def create_remote_file_record(
+        self,
+        user_id: str,
+        url: str,
+        filename: str,
+        metadata: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """为远程URL创建文件记录"""
+        # 生成文件ID
+        file_id = self.generate_file_id(filename)
         meta_path = self.get_metadata_path(user_id, file_id)
         
-        if not meta_path.exists():
-            return None
+        # 生成文件信息
+        file_info = {
+            "id": file_id,
+            "original_name": filename,
+            "size": 0,  # 未知
+            "type": self.get_file_type(filename),
+            "extension": self.get_file_extension(filename),
+            "source_type": "remote",  # 标记为远程URL
+            "source_url": url,  # 记录源URL
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "status": FileStatus.ACTIVE,
+            "converted": False,
+            "has_markdown": False,
+            "has_chunks": False
+        }
         
-        # 读取元数据
-        async with aiofiles.open(meta_path, 'r') as meta_file:
-            meta_content = await meta_file.read()
-            file_info = json.loads(meta_content)
-            
-            # 检查文件是否存在
-            file_path = Path(file_info["path"])
-            if not file_path.exists() and file_info.get("status") == FileStatus.ACTIVE:
-                # 文件不存在但元数据显示为活跃状态，更新状态
-                file_info["status"] = FileStatus.DELETED
-                async with aiofiles.open(meta_path, 'w') as update_file:
-                    await update_file.write(json.dumps(file_info, ensure_ascii=False))
-            
-            return file_info
-    
-    async def update_metadata(self, user_id: str, file_id: str, metadata: Dict[str, Any]) -> bool:
-        """更新文件元数据
-        
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            metadata: 新的元数据
-            
-        Returns:
-            是否更新成功
-        """
-        file_info = await self.get_file(user_id, file_id)
-        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
-            return False
-        
-        # 更新元数据，但保留核心字段
-        core_fields = ["id", "original_name", "size", "path", "created_at", "status"]
-        for key, value in metadata.items():
-            if key not in core_fields:
-                file_info[key] = value
-        
-        # 更新更新时间
-        file_info["updated_at"] = time.time()
+        # 添加额外元数据
+        if metadata:
+            file_info.update(metadata)
         
         # 保存元数据
-        meta_path = self.get_metadata_path(user_id, file_id)
         async with aiofiles.open(meta_path, 'w') as meta_file:
             await meta_file.write(json.dumps(file_info, ensure_ascii=False))
         
-        return True
+        return file_info
     
-    async def delete_file(self, user_id: str, file_id: str, delete_derived: bool = True) -> bool:
-        """完全删除文件和元数据
+    # 修改保存Markdown方法
+    async def save_markdown_file(
+        self, 
+        user_id: str, 
+        file_id: str,
+        markdown_content: str,
+        metadata: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """保存Markdown内容到文件"""
+        # 获取源文件信息
+        file_info = await self.get_file_meta(user_id, file_id)
+        if not file_info:
+            raise ValueError(f"文件不存在: {file_id}")
         
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            delete_derived: 是否删除派生文件
-            
-        Returns:
-            是否删除成功
-        """
+        # 保存到MD目录
+        md_file_path = self.get_md_file_path(user_id, file_id)
+        
+        # 保存Markdown内容
+        async with aiofiles.open(md_file_path, 'w', encoding='utf-8') as f:
+            await f.write(markdown_content)
+        
+        # 获取文件大小
+        file_size = os.path.getsize(md_file_path)
+        
+        # 更新元数据
+        update_data = {
+            "has_markdown": True,
+            "converted": True, 
+            "conversion_time": time.time(),
+            "md_file_size": file_size
+        }
+        
+        # 合并额外元数据
+        if metadata:
+            update_data.update(metadata)
+        
+        # 更新文件元数据
+        await self.update_metadata(user_id, file_id, update_data)
+        
+        # 返回更新后的文件信息
+        return await self.get_file_meta(user_id, file_id)
+    
+    # 修改保存切片方法
+    async def save_chunks(
+        self,
+        user_id: str,
+        file_id: str,
+        chunks: List[Dict[str, Any]],
+        metadata: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """保存文档切片到切片目录"""
         # 获取文件信息
-        file_info = await self.get_file(user_id, file_id)
+        file_info = await self.get_file_meta(user_id, file_id)
+        if not file_info:
+            raise ValueError(f"文件不存在: {file_id}")
+        
+        # 获取切片目录
+        chunks_dir = self.get_chunks_dir_path(user_id, file_id)
+        
+        # 保存切片文件
+        saved_chunks = []
+        for i, chunk in enumerate(chunks):
+            chunk_file_name = f"chunk_{i+1:03d}.txt"
+            chunk_file_path = chunks_dir / chunk_file_name
+            
+            # 保存切片内容
+            async with aiofiles.open(chunk_file_path, 'w', encoding='utf-8') as f:
+                await f.write(chunk["text"])
+            
+            # 记录切片信息
+            chunk_info = {
+                "index": i,
+                "file_name": chunk_file_name,
+                "path": str(chunk_file_path),
+                "size": len(chunk["text"]),
+            }
+            saved_chunks.append(chunk_info)
+        
+        # 更新元数据
+        update_data = {
+            "has_chunks": True,
+            "chunks_count": len(chunks),
+            "chunking_time": time.time(),
+            "chunks": saved_chunks  # 可选：是否在元数据中保存切片列表
+        }
+        
+        # 合并额外元数据
+        if metadata:
+            update_data.update(metadata)
+        
+        # 更新文件元数据
+        await self.update_metadata(user_id, file_id, update_data)
+        
+        # 返回更新后的文件信息
+        return await self.get_file_meta(user_id, file_id)
+    
+    # 修改获取Markdown内容的方法
+    async def get_markdown_content(self, user_id: str, file_id: str) -> str:
+        """获取Markdown内容"""
+        # 获取文件元数据
+        file_info = await self.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            raise FileNotFoundError(f"文件不存在: {file_id}")
+        
+        if not file_info.get("has_markdown", False):
+            raise FileNotFoundError(f"该文件没有Markdown内容: {file_id}")
+        
+        # 获取Markdown文件路径
+        md_file_path = self.get_md_file_path(user_id, file_id)
+        
+        # 文件存在性检查
+        if not md_file_path.exists():
+            raise FileNotFoundError(f"Markdown文件不存在: {md_file_path}")
+        
+        # 读取Markdown文件内容
+        try:
+            async with aiofiles.open(md_file_path, 'r', encoding='utf-8') as f:
+                return await f.read()
+        except Exception as e:
+            logger.error(f"读取Markdown内容失败: {md_file_path}, 错误: {e}")
+            raise FileNotFoundError(f"无法读取Markdown内容: {str(e)}")
+    
+    # 修改获取切片内容的迭代器
+    async def iter_chunks_content(
+        self, 
+        user_id: str,
+        file_id: str = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """生成文档切片内容"""
+        if file_id:
+            # 指定文件的切片
+            file_info = await self.get_file_meta(user_id, file_id)
+            if not file_info or not file_info.get("has_chunks", False):
+                return
+            
+            # 获取切片目录
+            chunks_dir = self.get_chunks_dir_path(user_id, file_id)
+            
+            # 读取切片
+            for i, chunk_info in enumerate(file_info.get("chunks", [])):
+                chunk_path = Path(chunk_info["path"])
+                try:
+                    async with aiofiles.open(chunk_path, 'r', encoding='utf-8') as f:
+                        content = await f.read()
+                        
+                        yield {
+                            "file_id": file_id,
+                            "chunk_index": i,
+                            "content": content,
+                            "metadata": {
+                                "user_id": user_id,
+                                "file_id": file_id,
+                                "original_name": file_info.get("original_name", ""),
+                                "source_type": file_info.get("source_type", "local"),
+                                "source_url": file_info.get("source_url", "")
+                            }
+                        }
+                except Exception as e:
+                    logger.error(f"读取切片内容失败: {chunk_path}, 错误: {e}")
+        else:
+            # 所有文件的切片
+            all_files = await self.list_files(user_id)
+            for file_info in all_files:
+                if file_info.get("has_chunks", False):
+                    async for chunk in self.iter_chunks_content(user_id, file_info["id"]):
+                        yield chunk
+    
+    # 计算用户存储使用量的方法需要修改
+    async def calculate_user_storage_usage(self, user_id: str) -> int:
+        """计算用户已使用的存储空间"""
+        total_size = 0
+        
+        # 原始文件目录
+        raw_dir = self.get_user_raw_dir(user_id)
+        for file_path in raw_dir.glob("*"):
+            if file_path.is_file():
+                total_size += file_path.stat().st_size
+        
+        # Markdown文件目录
+        md_dir = self.get_user_md_dir(user_id)
+        for file_path in md_dir.glob("*"):
+            if file_path.is_file():
+                total_size += file_path.stat().st_size
+        
+        # 切片目录
+        chunks_dir = self.get_user_chunks_dir(user_id)
+        for dir_path in chunks_dir.glob("*"):
+            if dir_path.is_dir():
+                for file_path in dir_path.glob("*"):
+                    if file_path.is_file():
+                        total_size += file_path.stat().st_size
+        
+        return total_size
+    
+    # 删除文件的方法需要修改
+    async def delete_file(self, user_id: str, file_id: str) -> bool:
+        """删除文件及其关联的Markdown和切片"""
+        # 获取文件信息
+        file_info = await self.get_file_meta(user_id, file_id)
         if not file_info:
             return False
         
-        # 如果有派生文件且需要删除
-        if delete_derived and "derived_files" in file_info:
-            for derived_id in file_info["derived_files"]:
-                # 递归调用但不删除更深层次的派生文件
-                await self.delete_file(user_id, derived_id, delete_derived=False)
-        
-        file_path = Path(file_info["path"])
-        meta_path = self.get_metadata_path(user_id, file_id)
-        
         success = True
         
-        # 物理删除文件
-        if file_path.exists():
-            try:
-                os.remove(file_path)
-                logger.info(f"已物理删除文件: {file_path}")
-            except Exception as e:
-                logger.error(f"删除文件失败: {file_path}, 错误: {e}")
-                success = False
+        # 1. 删除原始文件（如果是本地文件）
+        if file_info.get("source_type") == "local":
+            raw_file_path = self.get_raw_file_path(user_id, file_id)
+            if raw_file_path.exists():
+                try:
+                    os.remove(raw_file_path)
+                except Exception as e:
+                    logger.error(f"删除原始文件失败: {raw_file_path}, 错误: {e}")
+                    success = False
         
-        # 物理删除元数据
+        # 2. 删除Markdown文件
+        if file_info.get("has_markdown", False):
+            md_file_path = self.get_md_file_path(user_id, file_id)
+            if md_file_path.exists():
+                try:
+                    os.remove(md_file_path)
+                except Exception as e:
+                    logger.error(f"删除Markdown文件失败: {md_file_path}, 错误: {e}")
+                    success = False
+        
+        # 3. 删除切片目录
+        if file_info.get("has_chunks", False):
+            chunks_dir = self.get_chunks_dir_path(user_id, file_id)
+            if chunks_dir.exists():
+                try:
+                    shutil.rmtree(chunks_dir)
+                except Exception as e:
+                    logger.error(f"删除切片目录失败: {chunks_dir}, 错误: {e}")
+                    success = False
+        
+        # 4. 删除元数据
+        meta_path = self.get_metadata_path(user_id, file_id)
         if meta_path.exists():
             try:
                 os.remove(meta_path)
-                logger.info(f"已物理删除元数据: {meta_path}")
             except Exception as e:
                 logger.error(f"删除元数据失败: {meta_path}, 错误: {e}")
                 success = False
         
         return success
-    
+
     async def list_files(self, user_id: str) -> List[Dict[str, Any]]:
-        """列出用户所有文件（只返回物理存在的文件）
-        
-        Args:
-            user_id: 用户ID
-            
-        Returns:
-            文件信息列表
-        """
+        """列出用户所有文件"""
         user_meta_dir = self.get_user_meta_dir(user_id)
         files = []
         
@@ -433,210 +485,91 @@ class FilesService:
                     meta_content = await meta_file.read()
                     file_info = json.loads(meta_content)
                     
-                    # 检查文件是否物理存在
-                    file_path = Path(file_info["path"])
-                    if file_path.exists():
+                    # 只返回活跃状态的文件
+                    if file_info.get("status") == FileStatus.ACTIVE:
                         files.append(file_info)
-                    else:
-                        # 文件不存在，直接删除元数据
-                        try:
-                            os.remove(meta_path)
-                            logger.info(f"删除失效元数据: {meta_path}")
-                        except Exception as e:
-                            logger.error(f"删除失效元数据失败: {meta_path}, 错误: {e}")
+                        
             except Exception as e:
                 logger.error(f"读取文件元数据失败: {meta_path}, 错误: {e}")
         
         # 按创建时间降序排序
         files.sort(key=lambda x: x.get("created_at", 0), reverse=True)
         return files
-    
-    def get_download_url(self, user_id: str, file_id: str) -> str:
-        """获取文件下载URL
+
+    def is_valid_file_type(self, file_name: str) -> bool:
+        """检查文件类型是否有效"""
+        _, ext = os.path.splitext(file_name)
+        return ext.lower() in self.allowed_extensions
+
+    def get_file_extension(self, file_name: str) -> str:
+        """获取文件扩展名"""
+        _, ext = os.path.splitext(file_name)
+        return ext.lower()
+
+    def get_file_type(self, file_name: str) -> str:
+        """获取文件类型"""
+        _, ext = os.path.splitext(file_name)
+        return ext.lower()[1:]  # 去掉点号
+
+    def get_file_mimetype(self, file_name: str) -> str:
+        """获取文件MIME类型"""
+        _, ext = os.path.splitext(file_name)
+        mime_type = self._mime_types.get(ext.lower())
+        if not mime_type:
+            # 使用系统mimetypes库猜测
+            mime_type = mimetypes.guess_type(file_name)[0]
+        return mime_type or 'application/octet-stream'
+
+    async def get_file_meta(self, user_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+        """获取文件元数据
         
         Args:
             user_id: 用户ID
             file_id: 文件ID
             
         Returns:
-            文件下载URL
+            文件元数据，不存在则返回None
         """
-        return f"/api/files/{file_id}/download"
-    
-    def get_preview_url(self, user_id: str, file_id: str) -> str:
-        """获取文件预览URL
+        meta_path = self.get_metadata_path(user_id, file_id)
+        
+        if not meta_path.exists():
+            return None
+        
+        # 读取元数据
+        try:
+            async with aiofiles.open(meta_path, 'r') as meta_file:
+                meta_content = await meta_file.read()
+                return json.loads(meta_content)
+        except Exception as e:
+            logger.error(f"读取文件元数据失败: {meta_path}, 错误: {e}")
+            return None
+
+    async def update_metadata(self, user_id: str, file_id: str, metadata: Dict[str, Any]) -> bool:
+        """更新文件元数据
         
         Args:
             user_id: 用户ID
             file_id: 文件ID
+            metadata: 需要更新的元数据
             
         Returns:
-            文件预览URL
+            是否更新成功
         """
-        return f"/api/files/{file_id}/preview"
-    
-    async def get_file_stream(self, user_id: str, file_id: str, chunk_size: int = 1024 * 1024):
-        """流式读取文件内容
-        
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            chunk_size: 分块大小，默认1MB
-            
-        Yields:
-            文件内容分块
-        """
-        file_info = await self.get_file(user_id, file_id)
+        file_info = await self.get_file_meta(user_id, file_id)
         if not file_info or file_info.get("status") != FileStatus.ACTIVE:
-            raise FileNotFoundError(f"文件不存在: {file_id}")
+            return False
         
-        file_path = Path(file_info["path"])
-        if not file_path.exists():
-            # 文件物理不存在但元数据存在，更新状态
-            file_info["status"] = FileStatus.DELETED
-            meta_path = self.get_metadata_path(user_id, file_id)
-            async with aiofiles.open(meta_path, 'w') as meta_file:
-                await meta_file.write(json.dumps(file_info, ensure_ascii=False))
-            raise FileNotFoundError(f"文件不存在: {file_id}")
+        # 更新元数据
+        for key, value in metadata.items():
+            file_info[key] = value
         
-        # 流式读取文件
-        async with aiofiles.open(file_path, 'rb') as f:
-            while chunk := await f.read(chunk_size):
-                yield chunk
-    
-    async def process_file(self, user_id: str, file_id: str, process_type: str) -> Dict[str, Any]:
-        """处理文件（切片、转换等）
+        # 更新更新时间
+        file_info["updated_at"] = time.time()
         
-        Args:
-            user_id: 用户ID
-            file_id: 文件ID
-            process_type: 处理类型，如'slice', 'convert'等
-            
-        Returns:
-            处理结果
-        """
-        file_info = await self.get_file(user_id, file_id)
-        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
-            raise FileNotFoundError(f"文件不存在: {file_id}")
-        
-        # 更新状态为处理中
-        file_info["status"] = FileStatus.PROCESSING
-        file_info["process_type"] = process_type
-        file_info["process_started_at"] = time.time()
-        
+        # 保存元数据
         meta_path = self.get_metadata_path(user_id, file_id)
         async with aiofiles.open(meta_path, 'w') as meta_file:
             await meta_file.write(json.dumps(file_info, ensure_ascii=False))
         
-        # 这里放置处理逻辑，目前仅做占位
-        # TODO: 实现具体文件处理逻辑
-        
-        # 模拟处理延迟
-        await asyncio.sleep(1)
-        
-        # 更新处理完成状态
-        file_info["status"] = FileStatus.ACTIVE
-        file_info["processed"] = True
-        file_info["process_completed_at"] = time.time()
-        
-        async with aiofiles.open(meta_path, 'w') as meta_file:
-            await meta_file.write(json.dumps(file_info, ensure_ascii=False))
-        
-        return file_info
-
-    async def cleanup_deleted_metadata(self, days_threshold: int = 30):
-        """清理标记为删除且超过指定天数的元数据
-        
-        Args:
-            days_threshold: 删除后保留元数据的天数
-        """
-        current_time = time.time()
-        threshold = current_time - (days_threshold * 24 * 60 * 60)  # 转换为秒
-        
-        for user_dir in self.meta_dir.iterdir():
-            if user_dir.is_dir():
-                user_id = user_dir.name
-                for meta_path in user_dir.glob("*.json"):
-                    try:
-                        async with aiofiles.open(meta_path, 'r') as meta_file:
-                            meta_content = await meta_file.read()
-                            file_info = json.loads(meta_content)
-                            
-                            # 检查文件是否标记为已删除且超过阈值时间
-                            if (file_info.get("status") == FileStatus.DELETED and 
-                                file_info.get("updated_at", 0) < threshold):
-                                # 物理删除元数据文件
-                                os.remove(meta_path)
-                                logger.info(f"已清理过期元数据: {meta_path}")
-                    except Exception as e:
-                        logger.error(f"清理元数据失败: {meta_path}, 错误: {e}")
-
-    async def save_markdown_file(
-        self, 
-        user_id: str, 
-        source_file_id: str,
-        markdown_content: str,
-        metadata: Dict[str, Any] = None
-    ) -> Dict[str, Any]:
-        """保存从源文件派生的 Markdown 文件
-        
-        Args:
-            user_id: 用户ID
-            source_file_id: 源文件ID
-            markdown_content: Markdown内容
-            metadata: 额外的元数据
-            
-        Returns:
-            文件信息
-        """
-        # 获取源文件信息
-        source_file = await self.get_file(user_id, source_file_id)
-        if not source_file:
-            raise ValueError(f"源文件不存在: {source_file_id}")
-        
-        # 生成派生文件ID并确保使用 .md 扩展名
-        derived_file_id = f"{uuid.uuid4().hex}.md"
-        
-        # 使用与源文件相同的目录 - 注意这里不同于之前的实现，使用相同目录
-        source_path = Path(source_file["path"])
-        derived_path = source_path.parent / derived_file_id
-        
-        # 保存Markdown内容
-        async with aiofiles.open(derived_path, 'w', encoding='utf-8') as f:
-            await f.write(markdown_content)
-        
-        # 获取文件大小
-        file_size = os.path.getsize(derived_path)
-        
-        # 创建元数据
-        file_info = {
-            "id": derived_file_id,
-            "original_name": f"{Path(source_file['original_name']).stem}.md",
-            "size": file_size,
-            "type": "markdown",
-            "extension": ".md",
-            "path": str(derived_path),
-            "created_at": time.time(),
-            "updated_at": time.time(),
-            "status": FileStatus.ACTIVE,
-            "source_file_id": source_file_id,  # 关联到源文件
-        }
-        
-        # 添加额外元数据
-        if metadata:
-            file_info.update(metadata)
-        
-        # 保存元数据
-        meta_path = self.get_metadata_path(user_id, derived_file_id)
-        async with aiofiles.open(meta_path, 'w') as meta_file:
-            await meta_file.write(json.dumps(file_info, ensure_ascii=False))
-        
-        # 更新源文件元数据，添加派生文件引用
-        source_derived_files = source_file.get("derived_files", [])
-        source_derived_files.append(derived_file_id)
-        await self.update_metadata(user_id, source_file_id, {
-            "derived_files": source_derived_files
-        })
-        
-        return file_info
+        return True
 

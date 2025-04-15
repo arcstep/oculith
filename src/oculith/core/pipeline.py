@@ -381,15 +381,34 @@ class ObservablePipelineWrapper:
             # 创建一个异步任务执行pipeline处理
             process_task = asyncio.create_task(self._execute_pipeline_async(in_doc, raises_on_error))
             
-            # 定期产生状态更新
-            last_update_time = time.time()
+            # 添加超时机制和更新限制
+            MAX_UPDATES = 100  # 最大更新次数
+            update_count = 0
+            start_time = time.time()
+            max_execution_time = 300  # 最大执行时间5分钟
+            last_update_time = time.time()  # 这行被遗漏了！
+
             while not process_task.done():
                 current_time = time.time()
-                if current_time - last_update_time >= 0.5:  # 每0.5秒产生一次状态更新
+                
+                # 超时检查
+                if current_time - start_time > max_execution_time:
+                    logger.warning(f"文档处理超时，强制结束: {self.status_tracker.doc_id}")
+                    process_task.cancel()
+                    break
+                
+                # 更新次数限制
+                if update_count >= MAX_UPDATES:
+                    logger.warning(f"达到最大更新次数限制({MAX_UPDATES})，停止状态更新")
+                    break
+                
+                if current_time - last_update_time >= 2.0:  # 改为每2秒更新一次
                     yield self.status_tracker.to_dict()
                     last_update_time = current_time
+                    update_count += 1
+                    logger.debug(f"产生第{update_count}个状态更新")
                 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1.0)  # 改为更长的检查间隔
             
             # 获取处理结果
             result = await process_task
@@ -404,24 +423,33 @@ class ObservablePipelineWrapper:
                 # 提取文档内容
                 markdown_content = ""
                 if result.document:
+                    logger.info(f"有效的document对象，类型: {type(result.document)}, id: {id(result.document)}")
                     try:
                         # 尝试导出为Markdown
                         markdown_content = result.document.export_to_markdown()
+                        logger.info(f"导出为Markdown成功，长度: {len(markdown_content)}")
                     except Exception as e:
                         logger.warning(f"导出为Markdown失败: {str(e)}")
+                else:
+                    logger.warning("结果中没有document对象")
                 
                 # 返回成功状态
                 yield self.status_tracker.to_dict()
                 
-                # 返回处理结果，包含Markdown文本
-                yield {
+                # 记录即将返回的结果
+                result_dict = {
                     "type": "result",
                     "result_status": str(result.status),
                     "success": True,
-                    "content": markdown_content,
+                    "content": f"{len(markdown_content)}字符",
                     "content_type": "text/markdown",
                     "format": "markdown",
+                    "document": result.document  # 包含document对象
                 }
+                logger.info(f"返回结果对象，包含键: {list(result_dict.keys())}")
+                
+                # 返回处理结果，包含document对象
+                yield result_dict
             else:
                 error_msg = f"文档处理失败: {result.status}"
                 self._log_progress(DocumentProcessStage.ERROR, 1.0, error_msg)

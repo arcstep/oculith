@@ -1,7 +1,9 @@
+import os
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP", "False")
+
 from typing import Union, List, Optional, Dict, Any
 from litellm.caching.caching import Cache
 import litellm
-import os
 import requests
 import asyncio
 import aiohttp
@@ -16,10 +18,6 @@ class LiteLLM():
         model_type: 模型类型，"completion" 或 "embedding"
         kwargs: 其他希望填写到 complete 等操作中的参数
         """
-        # 禁用litellm的不必要网络请求
-        litellm.telemetry = False  # 禁用遥测数据收集
-        litellm.suppress_debug_info = True  # 抑制调试信息
-        litellm.model_cost_map_url = ""
         
         # 获取所有可用的 imitators
         self.all_imitators = self._get_all_imitators()
