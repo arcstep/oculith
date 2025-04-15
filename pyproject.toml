@@ -15,9 +15,12 @@ dependencies = [
     "python-dotenv>=0.19.0",
     "loguru>=0.5.3",
     "voidring>=0.1.0",
-    "soulseal (>=0.1.8,<0.2.0)",
     "torch (>=2.0.0,<2.3)",
     "docling>=2.30.0",
+    "litellm (>=1.66.0,<2.0.0)",
+    "chromadb (>=1.0.4,<2.0.0)",
+    "aiofiles (>=24.1.0,<25.0.0)",
+    "diskcache (>=5.6.3,<6.0.0)",
 ]
 
 [build-system]
@@ -31,3 +34,7 @@ packages = [
 
 [tool.poetry.scripts]
 oculith = "oculith.__main__:main"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+

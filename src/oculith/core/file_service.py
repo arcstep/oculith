@@ -367,19 +367,27 @@ class FilesService:
         
         return True
     
-    async def delete_file(self, user_id: str, file_id: str) -> bool:
+    async def delete_file(self, user_id: str, file_id: str, delete_derived: bool = True) -> bool:
         """完全删除文件和元数据
         
         Args:
             user_id: 用户ID
             file_id: 文件ID
+            delete_derived: 是否删除派生文件
             
         Returns:
             是否删除成功
         """
+        # 获取文件信息
         file_info = await self.get_file(user_id, file_id)
         if not file_info:
             return False
+        
+        # 如果有派生文件且需要删除
+        if delete_derived and "derived_files" in file_info:
+            for derived_id in file_info["derived_files"]:
+                # 递归调用但不删除更深层次的派生文件
+                await self.delete_file(user_id, derived_id, delete_derived=False)
         
         file_path = Path(file_info["path"])
         meta_path = self.get_metadata_path(user_id, file_id)
@@ -562,4 +570,73 @@ class FilesService:
                                 logger.info(f"已清理过期元数据: {meta_path}")
                     except Exception as e:
                         logger.error(f"清理元数据失败: {meta_path}, 错误: {e}")
+
+    async def save_markdown_file(
+        self, 
+        user_id: str, 
+        source_file_id: str,
+        markdown_content: str,
+        metadata: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """保存从源文件派生的 Markdown 文件
+        
+        Args:
+            user_id: 用户ID
+            source_file_id: 源文件ID
+            markdown_content: Markdown内容
+            metadata: 额外的元数据
+            
+        Returns:
+            文件信息
+        """
+        # 获取源文件信息
+        source_file = await self.get_file(user_id, source_file_id)
+        if not source_file:
+            raise ValueError(f"源文件不存在: {source_file_id}")
+        
+        # 生成派生文件ID并确保使用 .md 扩展名
+        derived_file_id = f"{uuid.uuid4().hex}.md"
+        
+        # 使用与源文件相同的目录 - 注意这里不同于之前的实现，使用相同目录
+        source_path = Path(source_file["path"])
+        derived_path = source_path.parent / derived_file_id
+        
+        # 保存Markdown内容
+        async with aiofiles.open(derived_path, 'w', encoding='utf-8') as f:
+            await f.write(markdown_content)
+        
+        # 获取文件大小
+        file_size = os.path.getsize(derived_path)
+        
+        # 创建元数据
+        file_info = {
+            "id": derived_file_id,
+            "original_name": f"{Path(source_file['original_name']).stem}.md",
+            "size": file_size,
+            "type": "markdown",
+            "extension": ".md",
+            "path": str(derived_path),
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "status": FileStatus.ACTIVE,
+            "source_file_id": source_file_id,  # 关联到源文件
+        }
+        
+        # 添加额外元数据
+        if metadata:
+            file_info.update(metadata)
+        
+        # 保存元数据
+        meta_path = self.get_metadata_path(user_id, derived_file_id)
+        async with aiofiles.open(meta_path, 'w') as meta_file:
+            await meta_file.write(json.dumps(file_info, ensure_ascii=False))
+        
+        # 更新源文件元数据，添加派生文件引用
+        source_derived_files = source_file.get("derived_files", [])
+        source_derived_files.append(derived_file_id)
+        await self.update_metadata(user_id, source_file_id, {
+            "derived_files": source_derived_files
+        })
+        
+        return file_info
 

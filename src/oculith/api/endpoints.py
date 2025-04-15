@@ -21,6 +21,7 @@ from docling.datamodel.base_models import ConversionStatus
 from ..core.converter import ObservableConverter
 from ..core.schemas import DocumentProcessStatus
 from ..core.file_service import FilesService, FileStatus
+from ..core.litellm import init_litellm
 
 token_sdk = TokenSDK(
     jwt_secret_key=os.environ.get("FASTAPI_SECRET_KEY", "MY-SECRET-KEY"),
@@ -102,10 +103,12 @@ def mount_docling_service(
         output_dir = os.path.join(tempfile.gettempdir(), "illufly_docling_output")
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"未指定输出目录，将使用临时目录: {output_dir}")
-    
+
+    # 初始化litellm
+    init_litellm(cache_dir=os.path.join(output_dir, "litellm_cache"))
+
     # 创建文件服务，使用相同的输出目录
-    files_dir = os.path.join(output_dir, "files")
-    files_service = FilesService(base_dir=files_dir)
+    files_service = FilesService(base_dir=os.path.join(output_dir, "files"))
     app.state.files_service = files_service
     
     logger.info(f"创建ObservableConverter和FileService: output_dir={output_dir}")

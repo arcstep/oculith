@@ -28,6 +28,7 @@ from docling.exceptions import ConversionError
 # 导入自定义组件
 from .schemas import DocumentProcessStage, DocumentProcessStatus
 from .pipeline import ObservablePipelineWrapper
+from .file_service import FilesService
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +42,15 @@ class ObservableConverter:
     def __init__(
         self,
         allowed_formats: Optional[List[InputFormat]] = None,
-        format_options: Optional[Dict[InputFormat, FormatOption]] = None
+        format_options: Optional[Dict[InputFormat, FormatOption]] = None,
+        files_service: Optional[FilesService] = None
     ):
         """初始化可观测转换器
         
         Args:
             allowed_formats: 允许处理的文档格式列表，为空表示允许所有支持的格式
             format_options: 各格式对应的处理选项
+            files_service: 文件服务实例
         """
         # 与官方实现保持一致
         self.allowed_formats = (
@@ -76,6 +79,8 @@ class ObservableConverter:
         
         # 兼容旧代码，使converter指向自身
         self.converter = self
+        
+        self.files_service = files_service  # 保存FileService实例
     
     def _get_pipeline_options_hash(self, pipeline_options) -> str:
         """生成pipeline选项的哈希值，用于缓存"""
@@ -406,4 +411,61 @@ class ObservableConverter:
                 )
             if raises_on_error:
                 raise
-            return None 
+            return None
+
+    async def convert_and_save(
+        self,
+        source: Union[Path, str, DocumentStream],
+        user_id: str,
+        file_id: str,
+        doc_id: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        raises_on_error: bool = True,
+        max_num_pages: int = sys.maxsize,
+        max_file_size: int = sys.maxsize,
+        page_range: PageRange = DEFAULT_PAGE_RANGE,
+    ) -> Dict[str, Any]:
+        """转换文档并保存结果"""
+        result = await self.convert_async(
+            source=source,
+            doc_id=doc_id,
+            headers=headers,
+            raises_on_error=raises_on_error,
+            max_num_pages=max_num_pages,
+            max_file_size=max_file_size,
+            page_range=page_range
+        )
+        
+        if result["status"] == ConversionStatus.SUCCESS and result["document"] and self.files_service:
+            # 转换成功且提供了FileService
+            markdown_content = result["document"].export_to_markdown()
+            
+            # 保存为markdown文件并关联
+            if self.files_service:
+                md_file = await self.files_service.save_markdown_file(
+                    user_id=user_id,
+                    source_file_id=file_id,
+                    markdown_content=markdown_content,
+                    metadata={
+                        "converted": True,
+                        "conversion_status": str(result["status"]),
+                        "conversion_time": time.time()
+                    }
+                )
+                
+                # 同时更新源文件元数据
+                await self.files_service.update_metadata(user_id, file_id, {
+                    "converted": True,
+                    "conversion_status": str(result["status"]),
+                    "conversion_time": time.time(),
+                    "markdown_file_id": md_file["id"]
+                })
+                
+                return {
+                    "success": True,
+                    "file_id": file_id,
+                    "markdown_file_id": md_file["id"],
+                    "content": markdown_content
+                }
+        
+        # 处理失败情况... 
