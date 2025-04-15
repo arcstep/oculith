@@ -424,46 +424,48 @@ class FilesService:
     
     # 删除文件的方法需要修改
     async def delete_file(self, user_id: str, file_id: str) -> bool:
-        """删除文件及其关联的Markdown和切片"""
-        # 获取文件信息
+        """删除文件及其所有关联数据"""
         file_info = await self.get_file_meta(user_id, file_id)
         if not file_info:
+            logger.warning(f"尝试删除不存在的文件: {file_id}")
             return False
         
         success = True
         
-        # 1. 删除原始文件（如果是本地文件）
-        if file_info.get("source_type") == "local":
-            raw_file_path = self.get_raw_file_path(user_id, file_id)
-            if raw_file_path.exists():
-                try:
-                    os.remove(raw_file_path)
-                except Exception as e:
-                    logger.error(f"删除原始文件失败: {raw_file_path}, 错误: {e}")
-                    success = False
+        # 删除所有可能存在的文件，不进行条件判断
+        # 1. 删除原始文件
+        raw_file_path = self.get_raw_file_path(user_id, file_id)
+        logger.info(f"删除原始文件: {raw_file_path}, 存在: {raw_file_path.exists()}")
+        if raw_file_path.exists():
+            try:
+                os.remove(raw_file_path)
+            except Exception as e:
+                logger.error(f"删除原始文件失败: {raw_file_path}, 错误: {e}")
+                success = False
         
         # 2. 删除Markdown文件
-        if file_info.get("has_markdown", False):
-            md_file_path = self.get_md_file_path(user_id, file_id)
-            if md_file_path.exists():
-                try:
-                    os.remove(md_file_path)
-                except Exception as e:
-                    logger.error(f"删除Markdown文件失败: {md_file_path}, 错误: {e}")
-                    success = False
+        md_file_path = self.get_md_file_path(user_id, file_id)
+        logger.info(f"删除Markdown文件: {md_file_path}, 存在: {md_file_path.exists()}")
+        if md_file_path.exists():
+            try:
+                os.remove(md_file_path)
+            except Exception as e:
+                logger.error(f"删除Markdown文件失败: {md_file_path}, 错误: {e}")
+                success = False
         
-        # 3. 删除切片目录
-        if file_info.get("has_chunks", False):
-            chunks_dir = self.get_chunks_dir_path(user_id, file_id)
-            if chunks_dir.exists():
-                try:
-                    shutil.rmtree(chunks_dir)
-                except Exception as e:
-                    logger.error(f"删除切片目录失败: {chunks_dir}, 错误: {e}")
-                    success = False
+        # 3. 删除切片目录及内容
+        chunks_dir = self.get_chunks_dir_path(user_id, file_id)
+        logger.info(f"删除切片目录: {chunks_dir}, 存在: {chunks_dir.exists()}")
+        if chunks_dir.exists():
+            try:
+                shutil.rmtree(chunks_dir)
+            except Exception as e:
+                logger.error(f"删除切片目录失败: {chunks_dir}, 错误: {e}")
+                success = False
         
-        # 4. 删除元数据
+        # 4. 最后才删除元数据，保证即使前面步骤失败也能重试
         meta_path = self.get_metadata_path(user_id, file_id)
+        logger.info(f"删除元数据文件: {meta_path}, 存在: {meta_path.exists()}")
         if meta_path.exists():
             try:
                 os.remove(meta_path)

@@ -606,11 +606,22 @@ def mount_docling_service(
     async def delete_file(
         file_id: str,
         token_data: Dict[str, Any] = Depends(verify_token),
-        files_service: FilesService = Depends(get_files_service)
+        files_service: FilesService = Depends(get_files_service),
+        retriever: ChromaRetriever = Depends(get_retriever)
     ):
         """删除文件"""
         user_id = token_data["user_id"]
         
+        # 1. 首先从向量库中删除文件相关的切片
+        try:
+            # 使用元数据过滤删除特定文件的切片
+            await delete_file_chunks_from_vectordb(user_id, file_id, retriever)
+            logger.info(f"已从向量库中删除文件切片: user_id={user_id}, file_id={file_id}")
+        except Exception as e:
+            logger.error(f"从向量库删除切片失败: {str(e)}")
+            # 继续执行文件删除，不因向量库操作失败而中断整个删除流程
+        
+        # 2. 然后删除文件资源
         success = await files_service.delete_file(user_id, file_id)
         if not success:
             raise HTTPException(status_code=404, detail="文件不存在或无法删除")
@@ -953,3 +964,25 @@ def mount_docling_service(
 
     # 注册路由
     app.include_router(router, prefix=prefix)
+
+async def delete_file_chunks_from_vectordb(user_id: str, file_id: str, retriever: ChromaRetriever) -> None:
+    """从向量库中删除指定文件的所有切片
+    
+    使用元数据过滤器删除特定文件的所有切片
+    """
+    # 使用where过滤条件删除
+    where_filter = {
+        "user_id": user_id,
+        "file_id": file_id
+    }
+    
+    # 从默认集合中删除
+    collection_name = "default"
+    
+    # 执行删除
+    retriever.delete(
+        collection_name=collection_name,
+        where=where_filter
+    )
+    
+    logger.info(f"已从向量库删除文件所有切片: user_id={user_id}, file_id={file_id}")

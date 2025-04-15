@@ -131,11 +131,18 @@ class ChromaRetriever():
         where: Dict[str, Any] = None,
     ) -> None:
         """删除文本"""
-        texts = self._deduplicate_texts(texts)
         collection_name = collection_name or "default"
         collection = self.client.get_collection(collection_name)
+        
+        # 只有当texts不为None时才进行去重和ID生成
         if texts is not None:
-            ids = self.get_ids(texts)
+            texts = self._deduplicate_texts(texts)
+            if ids is None:  # 如果没有提供ids，则使用文本生成ids
+                ids = self.get_ids(texts)
+        
+        # 记录删除操作
+        logger.info(f"删除向量库数据: collection={collection_name}, ids={ids}, where={where}")
+        
         return collection.delete(ids=ids, where=where)
 
     async def query(

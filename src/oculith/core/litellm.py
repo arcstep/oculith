@@ -53,8 +53,8 @@ class LiteLLM():
         self.kwargs = {**kwargs, "model": model}
         
         # 初始化日志
-        self.logger = logging.getLogger("illufly.llm")
-        self.logger.info(f"初始化 LiteLLM [imitator={self.imitator}, model_type={model_type}, provider=openai]")
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"初始化 LiteLLM [imitator={self.imitator}, model_type={model_type}, provider={self.provider}]")
         self.logger.info(f"可用imitators: {self.all_imitators}")
         self.logger.info(f"当前imitator可用模型: {models}")
 
