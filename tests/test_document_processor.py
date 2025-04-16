@@ -8,6 +8,7 @@ from tests.test_utils import upload_test_file, wait_for_task_completion
 
 # 获取logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARN)
 
 # 标记整个测试模块为异步
 pytestmark = pytest.mark.asyncio

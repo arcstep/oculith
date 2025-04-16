@@ -83,12 +83,12 @@ async def test_upload_convert_process_flow(async_client, auth_headers, test_docx
         )
         assert response.status_code == 200
         task_status = response.json()
-        status = task_status["status"]
+        status = task_status["status"].lower()  # 转为小写进行比较
         
         print(f"任务状态 (尝试 {attempt+1}/{max_attempts}): {status}")
         
         # 检查任务是否已完成或失败
-        if status in ["COMPLETED", "FAILED"]:
+        if status in ["completed", "failed", "error"]:
             final_status = status
             break
             
@@ -96,7 +96,7 @@ async def test_upload_convert_process_flow(async_client, auth_headers, test_docx
         await asyncio.sleep(1)
     
     # 断言任务最终完成
-    assert final_status == "COMPLETED", f"任务应当成功完成，但状态是: {final_status}"
+    assert final_status == "completed", f"任务应当成功完成，但状态是: {final_status}"
     
     # 4. 验证文件已被转换并有Markdown内容
     response = await async_client.get(
@@ -126,8 +126,8 @@ async def test_upload_convert_process_flow(async_client, auth_headers, test_docx
 
 async def test_remote_bookmark_convert(async_client, auth_headers):
     """测试收藏远程URL并转换的流程"""
-    # 使用公开可访问的URL (GitHub上的一个Markdown文件)
-    test_url = "https://raw.githubusercontent.com/docling-project/docling/main/README.md"
+    # 使用阿里云文档作为测试URL（加载更快，更稳定）
+    test_url = "https://help.aliyun.com/zh/model-studio/models"
     
     # 1. 收藏远程URL并启动处理
     data = {
@@ -156,46 +156,91 @@ async def test_remote_bookmark_convert(async_client, auth_headers):
     
     print(f"远程URL已收藏: file_id={file_id}, task_id={task_id}")
     
-    # 2. 检查任务状态并等待完成
-    max_attempts = 20
-    final_status = None
-    
-    for attempt in range(max_attempts):
+    try:
+        # 2. 检查任务状态并等待完成
+        max_attempts = 30  # 增加尝试次数，因为远程文件下载可能需要更长时间
+        final_status = None
+        
+        for attempt in range(max_attempts):
+            response = await async_client.get(
+                f"/oculith/tasks/{task_id}",
+                headers=auth_headers
+            )
+            if response.status_code != 200:
+                print(f"获取任务状态失败: {response.status_code}")
+                await asyncio.sleep(1)
+                continue
+                
+            task_status = response.json()
+            status = task_status["status"].lower()  # 转为小写进行比较
+            
+            print(f"远程URL任务状态 (尝试 {attempt+1}/{max_attempts}): {status}")
+            
+            if status in ["completed", "failed", "error"]:
+                final_status = status
+                break
+                
+            await asyncio.sleep(1)
+        
+        # 验证任务状态
+        print(f"远程URL处理最终状态: {final_status}")
+        
+        # 获取任务详细信息以查看可能的错误
+        if final_status == "failed":
+            task_response = await async_client.get(
+                f"/oculith/tasks/{task_id}",
+                headers=auth_headers
+            )
+            if task_response.status_code == 200:
+                task_info = task_response.json()
+                error_msg = task_info.get("error", "未知错误")
+                print(f"任务失败原因: {error_msg}")
+        
+        # 允许completed或failed状态，因为HTML处理可能会在某些环境下成功或失败
+        assert final_status in ["completed", "failed"], f"远程HTML文件处理任务应当完成或失败，但状态是: {final_status}"
+        
+        # 3. 检查文件信息
         response = await async_client.get(
-            f"/oculith/tasks/{task_id}",
+            f"/oculith/files/{file_id}",
             headers=auth_headers
         )
-        if response.status_code != 200:
-            print(f"获取任务状态失败: {response.status_code}")
-            await asyncio.sleep(1)
-            continue
-            
-        task_status = response.json()
-        status = task_status["status"]
+        assert response.status_code == 200
+        file_info = response.json()
         
-        print(f"远程URL任务状态 (尝试 {attempt+1}/{max_attempts}): {status}")
+        # 打印文件信息进行验证
+        print(f"远程URL文件信息: source_type={file_info.get('source_type')}, has_markdown={file_info.get('has_markdown')}")
         
-        if status in ["COMPLETED", "FAILED"]:
-            final_status = status
-            break
+        # 确保是远程来源的文件
+        assert file_info["source_type"] == "remote"
+        assert file_info["source_url"] == test_url
+        
+        # 如果文件成功转换，验证内容
+        if final_status == "completed" and file_info.get("has_markdown", False):
+            # 获取Markdown内容以验证内容已正确保存
+            response = await async_client.get(
+                f"/oculith/files/{file_id}/markdown",
+                headers=auth_headers
+            )
+            assert response.status_code == 200
+            markdown_result = response.json()
+            assert markdown_result["success"] is True
+            assert len(markdown_result["content"]) > 0, "Markdown内容不应为空"
+            print(f"成功获取Markdown内容，长度: {len(markdown_result['content'])}")
+    finally:
+        # 确保清理任务，避免未完成任务警告
+        try:
+            # 取消任务（即使已完成，调用此API也是安全的）
+            cancel_response = await async_client.post(
+                f"/oculith/tasks/{task_id}/cancel",
+                headers=auth_headers
+            )
+            print(f"任务清理状态: {cancel_response.status_code}")
             
-        await asyncio.sleep(1)
-    
-    # 验证任务状态
-    # 注意：远程URL处理可能会失败，取决于URL可访问性
-    print(f"远程URL处理最终状态: {final_status}")
-    
-    # 3. 检查文件信息
-    response = await async_client.get(
-        f"/oculith/files/{file_id}",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    file_info = response.json()
-    
-    # 打印文件信息进行验证
-    print(f"远程URL文件信息: source_type={file_info.get('source_type')}, has_markdown={file_info.get('has_markdown')}")
-    
-    # 确保是远程来源的文件
-    assert file_info["source_type"] == "remote"
-    assert file_info["source_url"] == test_url 
+            # 删除文件
+            delete_response = await async_client.delete(
+                f"/oculith/files/{file_id}",
+                headers=auth_headers
+            )
+            print(f"文件删除状态: {delete_response.status_code}")
+        except Exception as e:
+            print(f"清理资源时出错: {str(e)}") 

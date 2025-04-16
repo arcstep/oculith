@@ -12,32 +12,14 @@ from fastapi.testclient import TestClient
 from httpx import AsyncClient
 import httpx
 import types
-import warnings
+import time
 
 # 获取logger
 logger = logging.getLogger(__name__)
 
-# 过滤掉特定警告
-def pytest_configure(config):
-    warnings.filterwarnings("ignore", category=DeprecationWarning, module="asyncio")
-    warnings.filterwarnings("ignore", message="coroutine .* was never awaited")
-    warnings.filterwarnings("ignore", message="Task was destroyed but it is pending")
-    warnings.filterwarnings("ignore", message="Using or importing the ABCs from 'collections'")
-    # 针对httpx警告
-    warnings.filterwarnings("ignore", message="unclosed.*<(.*?)>", module="httpx")
-    
-    # 添加更多过滤
-    warnings.filterwarnings("ignore", message="There is no current event loop")
-    warnings.filterwarnings("ignore", message="(?s).*The object should be created from async function.*")
-    warnings.filterwarnings("ignore", message="RuntimeWarning: Enable tracemalloc")
-    warnings.filterwarnings("ignore", message="pytest-asyncio detected an unused fixture")
-    warnings.filterwarnings("ignore", message="After using context manager.*unclosed.*")
-    # 过滤redefinition警告
-    warnings.filterwarnings("ignore", message="redefinition of fixture 'event_loop'")
-
 # 配置日志
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARN,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
@@ -157,6 +139,29 @@ def event_loop():
     pending = asyncio.all_tasks(loop)
     if pending:
         logger.warning(f"测试结束时有{len(pending)}个未完成任务")
+        
+        # 取消所有未完成任务
         for task in pending:
-            if not task.done():
+            task_name = task.get_name()
+            # 此处修改：提供loop参数给current_task()，避免"no running event loop"错误
+            current = None
+            try:
+                current = asyncio.current_task(loop)
+            except RuntimeError:
+                # 忽略"no running event loop"错误
+                pass
+            
+            if not task.done() and task != current:
+                logger.info(f"取消任务: {task_name}")
                 task.cancel()
+        
+        # 简单等待短暂时间，让任务有机会完成取消操作
+        # 不使用事件循环的run_until_complete，因为在teardown可能已不可用
+        # 最多等待0.5秒
+        end_time = time.time() + 0.5
+        while time.time() < end_time:
+            still_pending = [t for t in pending if not t.done()]
+            if not still_pending:
+                break
+            time.sleep(0.05)  # 使用同步sleep
+

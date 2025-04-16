@@ -147,8 +147,10 @@ def mount_docling_service(
     # 初始化litellm
     init_litellm(cache_dir=os.path.join(output_dir, "litellm_cache"))
 
+    # 使用on_event方式处理生命周期事件
+    # 注意: 虽然on_event已弃用，但在mount_docling_service函数中使用lifespan参数有困难
     @app.on_event("startup")
-    async def startup_converter():
+    async def startup_event():
         # 创建转换器实例
         from docling.datamodel.base_models import InputFormat
         
@@ -225,7 +227,7 @@ def mount_docling_service(
         app.state.files_service.allowed_extensions = allowed_extensions
     
     @app.on_event("shutdown")
-    async def shutdown_queue_manager():
+    async def shutdown_event():
         """关闭应用时停止任务队列"""
         if hasattr(app.state, "queue_manager"):
             await app.state.queue_manager.stop()
@@ -1149,6 +1151,36 @@ def mount_docling_service(
             logger.error(f"收藏远程文件失败: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
+    # 新API端点：队列状态诊断
+    @router.get("/oculith/queue/diagnostics")
+    async def get_queue_diagnostics(
+        token_data: Dict[str, Any] = Depends(verify_token),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """获取队列管理器的诊断信息，用于调试"""
+        # 尝试获取管理员标志（可选）
+        is_admin = token_data.get("is_admin", False)
+        
+        # 获取基本诊断信息
+        diagnostics = await queue_manager.get_diagnostics()
+        
+        # 检查陷入停滞的任务
+        stalled_tasks = await queue_manager.check_stalled_tasks()
+        diagnostics["stalled_tasks"] = stalled_tasks
+        
+        # 非管理员用户只返回基本信息
+        if not is_admin:
+            return {
+                "is_running": diagnostics["is_running"],
+                "queue_size": diagnostics["queue_size"],
+                "active_tasks_count": diagnostics["active_tasks_count"],
+                "status_counts": diagnostics["status_counts"],
+                "stalled_tasks_count": len(stalled_tasks)
+            }
+        
+        # 管理员用户返回完整信息
+        return diagnostics
+
     # 注册路由
     app.include_router(router, prefix=prefix)
 
@@ -1194,24 +1226,134 @@ async def process_convert_task(
                 "error": f"文件不存在或已删除: {file_id}"
             }
         
+        # 检查是否为纯文本格式文件（md、markdown、txt）或HTML文件，这些文件可以直接保存为markdown
+        file_extension = file_info.get("extension", "").lower()
+        direct_process_extensions = [".md", ".markdown", ".txt", ".html", ".htm"]
+        
+        if file_extension in direct_process_extensions:
+            logger.info(f"检测到直接支持的文件格式: {file_id}，扩展名: {file_extension}，将直接处理")
+            
+            # 获取文件路径或内容
+            file_path = None
+            file_content = None
+            
+            if file_info.get("source_type") == "local":
+                # 本地文件，直接读取内容
+                file_path = files_service.get_raw_file_path(user_id, file_id)
+                if not file_path.exists():
+                    return {
+                        "success": False,
+                        "error": "文件不存在"
+                    }
+                try:
+                    # 尝试以UTF-8读取
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        file_content = f.read()
+                except UnicodeDecodeError:
+                    # 如果UTF-8解码失败，尝试以二进制读取再解码
+                    with open(file_path, "rb") as f:
+                        binary_data = f.read()
+                    try:
+                        # 尝试检测编码并解码
+                        import chardet
+                        detected = chardet.detect(binary_data)
+                        file_content = binary_data.decode(detected["encoding"] or "utf-8", errors="replace")
+                    except:
+                        # 所有尝试都失败，使用安全的替换机制
+                        file_content = binary_data.decode("utf-8", errors="replace")
+                        
+            elif file_info.get("source_type") == "remote":
+                # 远程文件，需要下载内容
+                import aiohttp
+                url = file_info.get("source_url")
+                if not url:
+                    return {
+                        "success": False,
+                        "error": "远程文件没有有效的URL"
+                    }
+                
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                return {
+                                    "success": False,
+                                    "error": f"无法下载远程文件: HTTP {response.status}"
+                                }
+                            
+                            # 获取内容类型
+                            content_type = response.headers.get("Content-Type", "")
+                            logger.info(f"远程文件内容类型: {content_type}")
+                            
+                            if "text/html" in content_type or file_extension in [".html", ".htm"]:
+                                # HTML内容需要特殊处理
+                                html_content = await response.text()
+                                
+                                # 简单HTML到Markdown转换
+                                try:
+                                    import html2text
+                                    h = html2text.HTML2Text()
+                                    h.ignore_links = False
+                                    h.ignore_images = False
+                                    h.ignore_tables = False
+                                    file_content = h.handle(html_content)
+                                except ImportError:
+                                    # 如果没有html2text库，直接使用HTML内容
+                                    file_content = html_content
+                                    logger.warning("未找到html2text库，将直接使用HTML内容")
+                            else:
+                                # 普通文本内容
+                                file_content = await response.text()
+                except Exception as e:
+                    logger.error(f"下载远程文件内容失败: {str(e)}", exc_info=True)
+                    return {
+                        "success": False,
+                        "error": f"下载远程文件内容失败: {str(e)}"
+                    }
+            
+            if not file_content:
+                return {
+                    "success": False,
+                    "error": "无法获取文件内容"
+                }
+            
+            # 直接保存为Markdown文件
+            await files_service.save_markdown_file(
+                user_id=user_id,
+                file_id=file_id,
+                markdown_content=file_content,
+                metadata={"conversion_status": "SUCCESS"}
+            )
+            
+            return {
+                "success": True,
+                "message": "文件直接保存为Markdown，无需转换",
+                "markdown_length": len(file_content)
+            }
+        
         # 获取文件路径
         file_path = None
         if file_info.get("source_type") == "local":
+            # 本地文件直接获取路径
             file_path = files_service.get_raw_file_path(user_id, file_id)
+            if not file_path.exists():
+                return {
+                    "success": False,
+                    "error": "文件不存在"
+                }
         elif file_info.get("source_type") == "remote":
-            # 远程文件使用URL作为源
+            # 远程文件直接使用URL作为源
             file_path = file_info.get("source_url")
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": "远程文件没有有效的URL"
+                }
         
         if not file_path:
             return {
                 "success": False,
-                "error": "文件路径无效"
-            }
-        
-        if isinstance(file_path, Path) and not file_path.exists():
-            return {
-                "success": False,
-                "error": "文件不存在"
+                "error": "无法确定文件路径"
             }
         
         # 执行转换
@@ -1219,6 +1361,7 @@ async def process_convert_task(
         
         # 收集所有更新
         updates = []
+        logger.info(f"开始处理文件: {file_path}, 类型: {type(file_path)}")
         async for update in converter.convert_async(
             source=str(file_path) if isinstance(file_path, Path) else file_path,
             doc_id=file_id,
