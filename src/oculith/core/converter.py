@@ -27,6 +27,7 @@ from docling.exceptions import ConversionError
 from docling.chunking import HybridChunker
 
 # 导入自定义组件
+from .retriever import LanceRetriever
 from .schemas import DocumentProcessStage, DocumentProcessStatus
 from .pipeline import ObservablePipelineWrapper
 from .file_service import FilesService
@@ -428,7 +429,7 @@ class ObservableConverter:
         max_num_pages: int = sys.maxsize,
         max_file_size: int = sys.maxsize,
         page_range: PageRange = DEFAULT_PAGE_RANGE,
-        retriever: Optional[Any] = None
+        retriever: Optional[LanceRetriever] = None
     ) -> Dict[str, Any]:
         """转换文档并保存结果"""
         # 存储所有更新

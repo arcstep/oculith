@@ -9,7 +9,7 @@ from .schemas import DocumentProcessStage, DocumentProcessStatus
 from .pipeline import ObservablePipelineWrapper
 from .converter import ObservableConverter
 from .litellm import LiteLLM, init_litellm
-from .retriever import ChromaRetriever
+from .retriever import LanceRetriever
 
 __all__ = [
     'DocumentProcessStage',
@@ -18,5 +18,5 @@ __all__ = [
     'ObservableConverter',
     'LiteLLM',
     'init_litellm',
-    'ChromaRetriever',
+    'LanceRetriever',
 ]
