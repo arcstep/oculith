@@ -22,6 +22,19 @@ class DocumentProcessStage(str, Enum):
     ERROR = "ERROR"  # 错误
 
 
+class FileProcessStatus(str, Enum):
+    """文件处理状态枚举"""
+    UPLOADED = "uploaded"     # 已上传/注册，尚未处理
+    CONVERTING = "converting"  # 正在转换中
+    CONVERTED = "converted"    # 转换完成，尚未切片
+    CHUNKING = "chunking"      # 正在切片中
+    CHUNKED = "chunked"        # 切片完成，尚未向量化
+    INDEXING = "indexing"      # 正在向量化索引中
+    COMPLETED = "completed"    # 所有处理完成
+    FAILED = "failed"          # 处理失败
+    QUEUED = "queued"          # 在队列中等待处理
+
+
 class DocumentProcessStatus:
     """文档处理状态类
     

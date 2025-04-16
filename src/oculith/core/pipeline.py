@@ -226,7 +226,7 @@ class ObservablePipelineWrapper:
         
         # 只有超过时间间隔才记录日志，以减少日志量
         if current_time - self.last_log_time >= self.log_interval:
-            logger.info(f"文档处理[{self.status_tracker.doc_id}]: {stage.value} - {progress:.1%} - {message}")
+            logger.debug(f"文档处理[{self.status_tracker.doc_id}]: {stage.value} - {progress:.1%} - {message}")
             self.last_log_time = current_time
     
     async def _progress_monitor(self):
@@ -246,7 +246,7 @@ class ObservablePipelineWrapper:
                         if preview:
                             message += f" | 内容预览: {preview}"
                     
-                    logger.info(f"文档处理[{self.status_tracker.doc_id}]: {self._current_stage.value} - 处理中... {message}")
+                    logger.debug(f"文档处理[{self.status_tracker.doc_id}]: {self._current_stage.value} - 处理中... {message}")
                     self.status_tracker.update(stage=self._current_stage, progress=self._current_progress, message=message)
                     self.last_log_time = current_time
                 
@@ -313,7 +313,7 @@ class ObservablePipelineWrapper:
         # 启动进度监控
         self.start_monitoring()
         
-        logger.info(f"开始处理文档 {in_doc.file.name if hasattr(in_doc, 'file') and hasattr(in_doc.file, 'name') else 'unknown'} [{self.status_tracker.doc_id}]")
+        logger.debug(f"开始处理文档 {in_doc.file.name if hasattr(in_doc, 'file') and hasattr(in_doc.file, 'name') else 'unknown'} [{self.status_tracker.doc_id}]")
         self._log_progress(DocumentProcessStage.INIT, 0.1, f"初始化文档处理")
         
         result = None
@@ -368,11 +368,12 @@ class ObservablePipelineWrapper:
         self.start_monitoring()
         
         # 初始化处理
-        logger.info(f"开始处理文档 {in_doc.file.name if hasattr(in_doc, 'file') and hasattr(in_doc.file, 'name') else 'unknown'} [{self.status_tracker.doc_id}]")
+        logger.debug(f"开始处理文档 {in_doc.file.name if hasattr(in_doc, 'file') and hasattr(in_doc.file, 'name') else 'unknown'} [{self.status_tracker.doc_id}]")
         self._log_progress(DocumentProcessStage.INIT, 0.1, f"初始化文档处理")
         
         # 产生初始状态
         yield self.status_tracker.to_dict()
+        await asyncio.sleep(0.01)  # 添加小延迟，确保消息被发送
         
         result = None
         error = None
@@ -402,13 +403,14 @@ class ObservablePipelineWrapper:
                     logger.warning(f"达到最大更新次数限制({MAX_UPDATES})，停止状态更新")
                     break
                 
-                if current_time - last_update_time >= 2.0:  # 改为每2秒更新一次
+                if current_time - last_update_time >= 2.0:
                     yield self.status_tracker.to_dict()
+                    await asyncio.sleep(0.01)  # 添加小延迟
                     last_update_time = current_time
                     update_count += 1
                     logger.debug(f"产生第{update_count}个状态更新")
                 
-                await asyncio.sleep(1.0)  # 改为更长的检查间隔
+                await asyncio.sleep(0.5)  # 将检查间隔改为0.5秒
             
             # 获取处理结果
             result = await process_task
@@ -423,11 +425,11 @@ class ObservablePipelineWrapper:
                 # 提取文档内容
                 markdown_content = ""
                 if result.document:
-                    logger.info(f"有效的document对象，类型: {type(result.document)}, id: {id(result.document)}")
+                    logger.debug(f"有效的document对象，类型: {type(result.document)}, id: {id(result.document)}")
                     try:
                         # 尝试导出为Markdown
                         markdown_content = result.document.export_to_markdown()
-                        logger.info(f"导出为Markdown成功，长度: {len(markdown_content)}")
+                        logger.debug(f"导出为Markdown成功，长度: {len(markdown_content)}")
                     except Exception as e:
                         logger.warning(f"导出为Markdown失败: {str(e)}")
                 else:
@@ -446,16 +448,18 @@ class ObservablePipelineWrapper:
                     "format": "markdown",
                     "document": result.document  # 包含document对象
                 }
-                logger.info(f"返回结果对象，包含键: {list(result_dict.keys())}")
+                logger.debug(f"返回结果对象，包含键: {list(result_dict.keys())}")
                 
                 # 返回处理结果，包含document对象
                 yield result_dict
+                await asyncio.sleep(0.01)  # 添加小延迟
             else:
                 error_msg = f"文档处理失败: {result.status}"
                 self._log_progress(DocumentProcessStage.ERROR, 1.0, error_msg)
                 
                 # 返回错误状态
                 yield self.status_tracker.to_dict()
+                await asyncio.sleep(0.01)  # 添加小延迟
                 
                 # 返回失败结果
                 yield {
@@ -467,6 +471,7 @@ class ObservablePipelineWrapper:
                     "content_type": "text/markdown",
                     "format": "markdown",
                 }
+                await asyncio.sleep(0.01)  # 添加小延迟
         except Exception as e:
             error = e
             error_msg = f"文档处理过程中出现异常: {str(e)}"
@@ -475,6 +480,7 @@ class ObservablePipelineWrapper:
             
             # 产生错误状态
             yield self.status_tracker.to_dict()
+            await asyncio.sleep(0.01)  # 添加小延迟
             
             if raises_on_error:
                 raise

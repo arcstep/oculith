@@ -232,97 +232,94 @@ class FilesService:
     async def save_markdown_file(
         self, 
         user_id: str, 
-        file_id: str,
+        file_id: str, 
         markdown_content: str,
-        metadata: Dict[str, Any] = None
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        """保存Markdown内容到文件"""
-        # 获取源文件信息
-        file_info = await self.get_file_meta(user_id, file_id)
-        if not file_info:
-            raise ValueError(f"文件不存在: {file_id}")
-        
-        # 保存到MD目录
-        md_file_path = self.get_md_file_path(user_id, file_id)
-        
-        # 保存Markdown内容
-        async with aiofiles.open(md_file_path, 'w', encoding='utf-8') as f:
-            await f.write(markdown_content)
-        
-        # 获取文件大小
-        file_size = os.path.getsize(md_file_path)
-        
-        # 更新元数据
-        update_data = {
-            "has_markdown": True,
-            "converted": True, 
-            "conversion_time": time.time(),
-            "md_file_size": file_size
-        }
-        
-        # 合并额外元数据
-        if metadata:
-            update_data.update(metadata)
-        
-        # 更新文件元数据
-        await self.update_metadata(user_id, file_id, update_data)
-        
-        # 返回更新后的文件信息
-        return await self.get_file_meta(user_id, file_id)
+        """保存Markdown文件"""
+        try:
+            # 获取markdown文件路径
+            md_file_path = self.get_md_file_path(user_id, file_id)
+            os.makedirs(md_file_path.parent, exist_ok=True)
+            
+            # 保存markdown文件
+            async with aiofiles.open(md_file_path, 'w', encoding='utf-8') as f:
+                await f.write(markdown_content)
+            
+            # 更新元数据 - 核心状态字段放在顶层
+            file_updates = {
+                "has_markdown": True,
+                "converted": True,
+                "conversion_time": time.time()
+            }
+            
+            # 添加额外元数据，也放在顶层保持一致性
+            if metadata:
+                file_updates.update(metadata)
+                
+            # 更新文件元数据
+            await self.update_metadata(user_id, file_id, file_updates)
+            
+            return await self.get_file_meta(user_id, file_id)
+        except Exception as e:
+            logger.error(f"保存Markdown文件失败: {str(e)}")
+            raise
     
     # 修改保存切片方法
-    async def save_chunks(
-        self,
-        user_id: str,
-        file_id: str,
-        chunks: List[Dict[str, Any]],
-        metadata: Dict[str, Any] = None
-    ) -> Dict[str, Any]:
-        """保存文档切片到切片目录"""
-        # 获取文件信息
-        file_info = await self.get_file_meta(user_id, file_id)
-        if not file_info:
-            raise ValueError(f"文件不存在: {file_id}")
-        
-        # 获取切片目录
-        chunks_dir = self.get_chunks_dir_path(user_id, file_id)
-        
-        # 保存切片文件
-        saved_chunks = []
-        for i, chunk in enumerate(chunks):
-            chunk_file_name = f"chunk_{i+1:03d}.txt"
-            chunk_file_path = chunks_dir / chunk_file_name
+    async def save_chunks(self, user_id: str, file_id: str, chunks: List[Dict[str, Any]]) -> bool:
+        """保存文档切片，使用连续编号"""
+        try:
+            # 创建目录
+            chunks_dir = self.get_chunks_dir_path(user_id, file_id)
+            os.makedirs(chunks_dir, exist_ok=True)
             
-            # 保存切片内容
-            async with aiofiles.open(chunk_file_path, 'w', encoding='utf-8') as f:
-                await f.write(chunk["text"])
+            # 保存每个切片，确保连续编号
+            chunks_meta = []
+            for i, chunk in enumerate(chunks):
+                # 使用连续的数字编号
+                chunk_index = i
+                
+                # 构建文件路径，使用固定位数便于排序
+                chunk_filename = f"chunk_{chunk_index:06d}.txt"
+                chunk_path = chunks_dir / chunk_filename
+                
+                # 获取内容
+                content = chunk.get("text", None) or chunk.get("content", None)
+                if content is None:
+                    logger.error(f"切片内容缺失: {chunk}")
+                    continue
+                    
+                # 保存内容
+                async with aiofiles.open(chunk_path, 'w', encoding='utf-8') as f:
+                    await f.write(content)
+                
+                # 记录切片元数据，包括前后切片索引信息
+                chunk_metadata = {
+                    "index": chunk_index,
+                    "path": str(chunk_path),
+                    "prev_index": chunk_index - 1 if chunk_index > 0 else None,
+                    "next_index": chunk_index + 1 if chunk_index < len(chunks) - 1 else None,
+                    "filename": chunk_filename
+                }
+                
+                # 添加原始元数据
+                if "metadata" in chunk:
+                    chunk_metadata.update(chunk["metadata"])
+                    
+                chunks_meta.append(chunk_metadata)
             
-            # 记录切片信息
-            chunk_info = {
-                "index": i,
-                "file_name": chunk_file_name,
-                "path": str(chunk_file_path),
-                "size": len(chunk["text"]),
-            }
-            saved_chunks.append(chunk_info)
-        
-        # 更新元数据
-        update_data = {
-            "has_chunks": True,
-            "chunks_count": len(chunks),
-            "chunking_time": time.time(),
-            "chunks": saved_chunks  # 可选：是否在元数据中保存切片列表
-        }
-        
-        # 合并额外元数据
-        if metadata:
-            update_data.update(metadata)
-        
-        # 更新文件元数据
-        await self.update_metadata(user_id, file_id, update_data)
-        
-        # 返回更新后的文件信息
-        return await self.get_file_meta(user_id, file_id)
+            # 更新文件元数据
+            await self.update_metadata(user_id, file_id, {
+                "has_chunks": True, 
+                "chunks_count": len(chunks), 
+                "chunking_time": time.time(),
+                "chunks": chunks_meta  # 存储完整的切片元数据
+            })
+            
+            return True
+        except Exception as e:
+            logger.error(f"保存切片失败: {str(e)}")
+            return False
     
     # 修改获取Markdown内容的方法
     async def get_markdown_content(self, user_id: str, file_id: str) -> str:
@@ -335,7 +332,7 @@ class FilesService:
         if not file_info.get("has_markdown", False):
             raise FileNotFoundError(f"该文件没有Markdown内容: {file_id}")
         
-        # 获取Markdown文件路径
+        # 使用与save_markdown_file一致的路径
         md_file_path = self.get_md_file_path(user_id, file_id)
         
         # 文件存在性检查
@@ -547,31 +544,122 @@ class FilesService:
             return None
 
     async def update_metadata(self, user_id: str, file_id: str, metadata: Dict[str, Any]) -> bool:
-        """更新文件元数据
+        """更新文件元数据"""
+        try:
+            # 获取元数据文件路径
+            meta_path = self.get_metadata_path(user_id, file_id)
+            
+            # 读取现有元数据
+            meta = {}
+            if os.path.exists(meta_path):
+                async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    if content:
+                        meta = json.loads(content)
+            
+            # 直接更新顶层元数据
+            meta.update(metadata)  # 扁平化结构
+            
+            # 写入更新后的元数据
+            async with aiofiles.open(meta_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(meta, ensure_ascii=False))
+            
+            return True
+        except Exception as e:
+            logger.error(f"更新元数据失败: {str(e)}")
+            return False
+
+    async def get_adjacent_chunks(self, user_id: str, file_id: str, chunk_index: int, 
+                                  window: int = 1) -> Dict[str, Any]:
+        """获取指定切片的相邻切片
         
         Args:
             user_id: 用户ID
             file_id: 文件ID
-            metadata: 需要更新的元数据
+            chunk_index: 当前切片索引
+            window: 获取前后多少个切片
             
         Returns:
-            是否更新成功
+            包含前后切片内容的字典
         """
-        file_info = await self.get_file_meta(user_id, file_id)
-        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
-            return False
-        
-        # 更新元数据
-        for key, value in metadata.items():
-            file_info[key] = value
-        
-        # 更新更新时间
-        file_info["updated_at"] = time.time()
-        
-        # 保存元数据
-        meta_path = self.get_metadata_path(user_id, file_id)
-        async with aiofiles.open(meta_path, 'w') as meta_file:
-            await meta_file.write(json.dumps(file_info, ensure_ascii=False))
-        
-        return True
+        try:
+            # 获取文件元数据
+            file_info = await self.get_file_meta(user_id, file_id)
+            if not file_info or not file_info.get("has_chunks", False):
+                return {"error": "文件没有切片"}
+            
+            chunks_meta = file_info.get("chunks", [])
+            if not chunks_meta:
+                return {"error": "切片元数据不存在"}
+            
+            # 查找当前切片
+            current_chunk = None
+            for chunk in chunks_meta:
+                if chunk["index"] == chunk_index:
+                    current_chunk = chunk
+                    break
+                
+            if not current_chunk:
+                return {"error": f"切片索引不存在: {chunk_index}"}
+            
+            # 获取相邻切片索引
+            prev_indices = []
+            next_indices = []
+            
+            for i in range(1, window + 1):
+                prev_idx = chunk_index - i
+                if prev_idx >= 0:
+                    prev_indices.append(prev_idx)
+                    
+                next_idx = chunk_index + i
+                if next_idx < len(chunks_meta):
+                    next_indices.append(next_idx)
+                    
+            # 读取切片内容
+            result = {
+                "current": {"index": chunk_index, "content": ""},
+                "previous": [],
+                "next": []
+            }
+            
+            # 读取当前切片
+            current_path = Path(current_chunk["path"])
+            if current_path.exists():
+                async with aiofiles.open(current_path, 'r', encoding='utf-8') as f:
+                    result["current"]["content"] = await f.read()
+            
+            # 读取前向切片
+            for idx in prev_indices:
+                for chunk in chunks_meta:
+                    if chunk["index"] == idx:
+                        chunk_path = Path(chunk["path"])
+                        if chunk_path.exists():
+                            async with aiofiles.open(chunk_path, 'r', encoding='utf-8') as f:
+                                result["previous"].append({
+                                    "index": idx,
+                                    "content": await f.read()
+                                })
+                        break
+            
+            # 读取后向切片
+            for idx in next_indices:
+                for chunk in chunks_meta:
+                    if chunk["index"] == idx:
+                        chunk_path = Path(chunk["path"])
+                        if chunk_path.exists():
+                            async with aiofiles.open(chunk_path, 'r', encoding='utf-8') as f:
+                                result["next"].append({
+                                    "index": idx,
+                                    "content": await f.read()
+                                })
+                        break
+            
+            # 按索引排序
+            result["previous"].sort(key=lambda x: x["index"], reverse=True)
+            result["next"].sort(key=lambda x: x["index"])
+            
+            return result
+        except Exception as e:
+            logger.error(f"获取相邻切片失败: {str(e)}")
+            return {"error": str(e)}
 

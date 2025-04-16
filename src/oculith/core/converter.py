@@ -13,6 +13,9 @@ from pathlib import Path
 from datetime import datetime
 from functools import partial
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=True)
+
 # 导入docling组件
 from docling.pipeline.base_pipeline import BasePipeline
 from docling.datamodel.document import ConversionResult, InputDocument
@@ -113,7 +116,7 @@ class ObservableConverter:
         cache_key = (pipeline_class, options_hash)
 
         if cache_key not in self.initialized_pipelines:
-            logger.info(
+            logger.debug(
                 f"初始化pipeline: {pipeline_class.__name__}, 选项哈希: {options_hash}"
             )
             self.initialized_pipelines[cache_key] = pipeline_class(
@@ -332,7 +335,7 @@ class ObservableConverter:
             pipeline_update_count = 0
             async for update in observable_pipeline.execute_async(in_doc, raises_on_error):
                 pipeline_update_count += 1
-                logger.info(f"从pipeline获取第{pipeline_update_count}个更新: 类型={type(update)}, 键={list(update.keys())}")
+                logger.debug(f"从pipeline获取第{pipeline_update_count}个更新: 类型={type(update)}, 键={list(update.keys())}")
                 yield update
                 
         except Exception as e:
@@ -438,7 +441,7 @@ class ObservableConverter:
         update_count = 0
         
         # 记录开始转换
-        logger.info(f"开始转换并保存文档: source={source}, user_id={user_id}, file_id={file_id}")
+        logger.debug(f"开始转换并保存文档: source={source}, user_id={user_id}, file_id={file_id}")
         
         async for update in self.convert_async(
             source=source,
@@ -451,21 +454,21 @@ class ObservableConverter:
         ):
             update_count += 1
             # 记录每个更新的基本信息
-            logger.info(f"收到第{update_count}个更新: 类型={type(update)}, 包含键={list(update.keys())}")
+            logger.debug(f"收到第{update_count}个更新: 类型={type(update)}, 包含键={list(update.keys())}")
             
             all_updates.append(update)
             # 特别寻找包含文档对象的更新
             if "document" in update:
-                logger.info(f"找到包含document的更新: stage={update.get('stage')}, type={type(update['document'])}")
+                logger.debug(f"找到包含document的更新: stage={update.get('stage')}, type={type(update['document'])}")
                 doc_result = update
         
         # 记录处理结果
-        logger.info(f"处理完成: 共收到{update_count}个更新, 找到document对象: {doc_result is not None}")
+        logger.debug(f"处理完成: 共收到{update_count}个更新, 找到document对象: {doc_result is not None}")
         
         if doc_result and "document" in doc_result:
             # 提取文档对象
             document = doc_result["document"]
-            logger.info(f"成功提取document对象，类型: {type(document)}")
+            logger.debug(f"成功提取document对象，类型: {type(document)}")
             
             # 转换为markdown
             markdown_content = document.export_to_markdown()

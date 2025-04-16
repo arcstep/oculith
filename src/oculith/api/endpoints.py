@@ -10,6 +10,7 @@ import time
 import json
 from typing import Any, Dict, List, Optional, Callable, Awaitable, Union, AsyncGenerator
 from pathlib import Path
+from functools import partial
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, UploadFile, Query, Request
 from pydantic import BaseModel, HttpUrl
@@ -19,10 +20,11 @@ from docling.datamodel.base_models import ConversionStatus
 
 # 导入核心组件
 from ..core.converter import ObservableConverter
-from ..core.schemas import DocumentProcessStatus
+from ..core.schemas import DocumentProcessStatus, FileProcessStatus
 from ..core.file_service import FilesService, FileStatus
 from ..core.litellm import init_litellm
 from ..core.retriever import LanceRetriever
+from ..core.queue_manager import QueueManager, TaskType, FileTask
 
 token_sdk = TokenSDK(
     jwt_secret_key=os.environ.get("FASTAPI_SECRET_KEY", "MY-SECRET-KEY"),
@@ -33,13 +35,31 @@ verify_token = token_sdk.get_auth_dependency()
 
 logger = logging.getLogger(__name__)
 
+# 通用函数：确保队列管理器正在运行
+async def ensure_queue_manager_running(queue_manager: QueueManager) -> None:
+    """确保队列管理器正在运行，如果已停止则重启它
+    
+    检查工作进程状态，并在必要时重启队列管理器。
+    在所有向队列添加任务的API端点中调用此函数，确保队列正常运行。
+    """
+    if (queue_manager.worker_task is None or 
+        queue_manager.worker_task.done() or 
+        queue_manager.worker_task.cancelled()):
+        # 强制重置运行状态
+        queue_manager.is_running = False
+        queue_manager.worker_task = None
+        logger.warning("检测到工作进程未运行或已取消，正在重新启动...")
+        await queue_manager.start()
+        logger.info("队列管理器已重新启动，工作进程ID: " + 
+                   (str(id(queue_manager.worker_task)) if queue_manager.worker_task else "无"))
+
 # 文件元数据请求模型
 class FileMetadataUpdate(BaseModel):
     """文件元数据更新请求"""
     title: Optional[str] = None
     description: Optional[str] = None
     tags: Optional[List[str]] = None
-    custom_metadata: Optional[Dict[str, Any]] = None
+    extra_fields: Optional[Dict[str, Any]] = None  # 用于接收任何附加字段
 
 
 # 定义请求模型
@@ -89,11 +109,30 @@ def format_allowed_extensions(allowed_formats):
     
     return list(set(extensions))  # 去重
 
+def format_sse(data: Dict[str, Any], event: Optional[str] = None) -> str:
+    """格式化数据为SSE格式"""
+    message = []
+    
+    # 添加事件类型（如果有）
+    if event is not None:
+        message.append(f"event: {event}")
+    
+    # 添加数据（JSON格式）
+    json_data = json.dumps(data, ensure_ascii=False)
+    for line in json_data.splitlines():
+        message.append(f"data: {line}")
+    
+    # 添加空行表示消息结束
+    message.append("")
+    message.append("")
+    
+    return "\n".join(message)
+
 def mount_docling_service(
     app: FastAPI,
     output_dir: Optional[str] = None,
     allowed_formats: Optional[List[str]] = None,
-    prefix: str = "/"
+    prefix: str = ""
 ) -> None:
     """挂载文档处理服务到FastAPI应用"""
     # 创建路由
@@ -113,6 +152,9 @@ def mount_docling_service(
         # 创建转换器实例
         from docling.datamodel.base_models import InputFormat
         
+        # 导入任务队列管理器
+        from ..core.queue_manager import QueueManager, TaskType, FileTask
+        
         # 如果指定了允许的格式，将其转换为InputFormat枚举
         converter_allowed_formats = None
         if allowed_formats:
@@ -130,9 +172,63 @@ def mount_docling_service(
         # 初始化LanceRetriever
         app.state.retriever = LanceRetriever(output_dir=os.path.join(output_dir, "lance_db"))
         
+        # 初始化任务队列管理器
+        app.state.queue_manager = QueueManager(max_concurrent_tasks=3)
+        
+        # 启动任务队列
+        await app.state.queue_manager.start()
+        
+        # 在注册处理器之前增加日志
+        logger.info("开始注册任务处理器...")
+        for task_type in [TaskType.CONVERT, TaskType.CHUNK, TaskType.INDEX, TaskType.PROCESS_ALL]:
+            logger.info(f"注册处理器: {task_type.value}")
+        
+        # 注册任务处理器
+        await app.state.queue_manager.register_processor(
+            TaskType.CONVERT, 
+            partial(process_convert_task, 
+                    converter=app.state.converter,
+                    files_service=app.state.files_service)
+        )
+        
+        await app.state.queue_manager.register_processor(
+            TaskType.CHUNK, 
+            partial(process_chunk_task,
+                    converter=app.state.converter,
+                    files_service=app.state.files_service)
+        )
+        
+        await app.state.queue_manager.register_processor(
+            TaskType.INDEX, 
+            partial(process_index_task,
+                    files_service=app.state.files_service,
+                    retriever=app.state.retriever)
+        )
+        
+        await app.state.queue_manager.register_processor(
+            TaskType.PROCESS_ALL, 
+            partial(process_all_task,
+                    converter=app.state.converter,
+                    files_service=app.state.files_service,
+                    retriever=app.state.retriever)
+        )
+        
+        # 在处理器注册后增加验证
+        for task_type in [TaskType.CONVERT, TaskType.CHUNK, TaskType.INDEX, TaskType.PROCESS_ALL]:
+            if task_type not in app.state.queue_manager._processors:
+                logger.error(f"处理器注册失败: {task_type.value}")
+            else:
+                logger.info(f"处理器注册成功: {task_type.value}")
+        
         # 更新FileService的允许扩展名
         allowed_extensions = format_allowed_extensions([fmt.value for fmt in app.state.converter.allowed_formats])
         app.state.files_service.allowed_extensions = allowed_extensions
+    
+    @app.on_event("shutdown")
+    async def shutdown_queue_manager():
+        """关闭应用时停止任务队列"""
+        if hasattr(app.state, "queue_manager"):
+            await app.state.queue_manager.stop()
     
     # 获取检索器的依赖
     async def get_retriever():
@@ -145,7 +241,11 @@ def mount_docling_service(
     # 获取文件服务的依赖
     async def get_files_service():
         return app.state.files_service
-        
+    
+    # 获取任务队列管理器
+    async def get_queue_manager():
+        return app.state.queue_manager
+    
     # 服务信息
     @router.get("/oculith/info")
     async def get_service_info(
@@ -182,382 +282,7 @@ def mount_docling_service(
             }
         except Exception as e:
             logger.error(f"获取格式列表时出错: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    # 在文件顶部添加格式化SSE函数
-    def format_sse(data: Dict[str, Any], event: Optional[str] = None) -> str:
-        """格式化数据为SSE格式
-        
-        Args:
-            data: 要发送的数据
-            event: 事件名称（可选）
-            
-        Returns:
-            符合SSE格式的字符串
-        """
-        message = []
-        
-        # 添加事件类型（如果有）
-        if event is not None:
-            message.append(f"event: {event}")
-        
-        # 添加数据（JSON格式）- 确保每行以data:开头
-        json_data = json.dumps(data, ensure_ascii=False)
-        for line in json_data.splitlines():
-            message.append(f"data: {line}")
-        
-        # 添加空行表示消息结束
-        message.append("")
-        message.append("")
-        
-        return "\n".join(message)
 
-    # 定义一个用于流式处理文档转换的通用函数
-    async def stream_document_conversion(
-        source: Union[Path, str],
-        user_id: str, 
-        file_id: str,
-        converter: ObservableConverter,
-        files_service: FilesService,
-        retriever: Optional[LanceRetriever] = None
-    ) -> AsyncGenerator[str, None]:
-        """以SSE格式流式处理文档转换
-        
-        Args:
-            source: 文档来源（路径或URL）
-            user_id: 用户ID
-            file_id: 文件ID
-            converter: 文档转换器
-            files_service: 文件服务
-            retriever: 向量检索器（可选）
-            
-        Yields:
-            SSE格式的状态更新
-        """
-        document = None
-        markdown_content = ""
-        
-        try:
-            # 发送初始化事件
-            yield format_sse({
-                "type": "init",
-                "file_id": file_id,
-                "status": "processing"
-            }, event="init")
-            
-            # 计数器
-            update_count = 0
-            has_result = False
-            
-            # 监听转换过程中的所有更新
-            async for update in converter.convert_async(
-                source=source,
-                doc_id=file_id,  # 使用文件ID作为文档ID
-                raises_on_error=True
-            ):
-                update_count += 1
-                
-                # 发送进度更新
-                if "stage" in update and "progress" in update:
-                    progress_data = {
-                        "type": "progress",
-                        "file_id": file_id,
-                        "stage": update.get("stage"),
-                        "progress": update.get("progress", 0),
-                        "message": update.get("message", "")
-                    }
-                    yield format_sse(progress_data, event="progress")
-                
-                # 检查是否有最终结果（包含document对象）
-                if "document" in update:
-                    has_result = True
-                    document = update["document"]
-                
-                # 如果是错误更新
-                if update.get("stage") == "ERROR":
-                    error_msg = update.get("error", "未知错误")
-                    yield format_sse({
-                        "type": "error",
-                        "file_id": file_id,
-                        "message": error_msg
-                    }, event="error")
-                    
-                    # 更新文件元数据
-                    await files_service.update_metadata(user_id, file_id, {
-                        "converted": False,
-                        "conversion_status": "ERROR",
-                        "conversion_time": time.time(),
-                        "conversion_error": error_msg
-                    })
-                    
-                    return
-            
-            # 处理文档转换结果
-            if document:
-                # 提取Markdown内容
-                markdown_content = document.export_to_markdown()
-                
-                # 保存Markdown到文件系统
-                await files_service.save_markdown_file(
-                    user_id=user_id,
-                    file_id=file_id,
-                    markdown_content=markdown_content,
-                    metadata={"conversion_status": "SUCCESS"}
-                )
-                
-                # 对文档进行切片
-                chunks = converter.chunk_document(document)
-                
-                # 保存切片
-                await files_service.save_chunks(
-                    user_id=user_id,
-                    file_id=file_id,
-                    chunks=chunks
-                )
-                
-                # 发送切片生成事件
-                yield format_sse({
-                    "type": "chunks",
-                    "file_id": file_id,
-                    "chunks_count": len(chunks)
-                }, event="chunks")
-                
-                # 如果提供了检索器，则添加切片到向量库
-                if retriever:
-                    indexed_chunks = 0     # 成功索引的切片
-                    total_chunks = len(chunks)  # 切片总数
-                    skipped_chunks = 0     # 跳过的切片
-                    
-                    async for chunk_data in files_service.iter_chunks_content(user_id, file_id):
-                        try:
-                            # 使用try添加到向量库
-                            add_result = await retriever.add(
-                                texts=chunk_data["content"],
-                                user_id=user_id,
-                                metadatas={
-                                    "file_id": file_id,
-                                    "chunk_index": chunk_data.get("chunk_index", 0),
-                                    **chunk_data.get("metadata", {})
-                                }
-                            )
-                            # 安全获取添加的数量和跳过的数量
-                            if isinstance(add_result, dict):
-                                indexed_chunks += add_result.get("added", 0)
-                                skipped_chunks += add_result.get("skipped", 0)
-                        except Exception as e:
-                            logger.error(f"向量化切片失败: {str(e)}")
-                            skipped_chunks += 1
-                    
-                    # 发送索引完成事件，包含更完整的信息
-                    yield format_sse({
-                        "type": "indexed",
-                        "file_id": file_id,
-                        "indexed_chunks": indexed_chunks,
-                        "total_chunks": total_chunks,
-                        "skipped_chunks": skipped_chunks
-                    }, event="indexed")
-                
-                # 发送完成事件
-                yield format_sse({
-                    "type": "complete",
-                    "file_id": file_id,
-                    "success": True,
-                    "content_length": len(markdown_content),
-                    "chunks_count": len(chunks)
-                }, event="complete")
-                
-                return
-            
-            # 如果没有得到文档结果
-            yield format_sse({
-                "type": "error",
-                "file_id": file_id,
-                "message": "转换过程未产生有效文档"
-            }, event="error")
-            
-            # 更新文件元数据
-            await files_service.update_metadata(user_id, file_id, {
-                "converted": False,
-                "conversion_status": "ERROR",
-                "conversion_time": time.time(),
-                "conversion_error": "转换过程未产生有效文档"
-            })
-            
-        except Exception as e:
-            # 记录异常日志
-            logger.error(f"转换过程出错: {str(e)}", exc_info=True)
-            
-            # 发送错误事件
-            yield format_sse({
-                "type": "error",
-                "file_id": file_id,
-                "message": f"转换过程出错: {str(e)}"
-            }, event="error")
-            
-            # 更新文件元数据
-            await files_service.update_metadata(user_id, file_id, {
-                "converted": False,
-                "conversion_status": "ERROR",
-                "conversion_time": time.time(),
-                "conversion_error": str(e)
-            })
-
-    # 上传并转换 - 整合FileService
-    @router.post("/oculith/upload/convert")
-    async def upload_and_convert(
-        request: Request,
-        file: UploadFile = File(...),
-        title: Optional[str] = Form(None),
-        description: Optional[str] = Form(None),
-        tags: Optional[str] = Form(None),
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter),
-        files_service: FilesService = Depends(get_files_service),
-        retriever: LanceRetriever = Depends(get_retriever)
-    ):
-        """上传文件、保存到文件系统并转换为Markdown - 支持SSE实时进度"""
-        user_id = token_data["user_id"]
-        logger.info(f"上传并转换请求: 用户ID={user_id}, 文件名={file.filename}")
-        
-        try:
-            # 准备元数据
-            metadata = {}
-            if title:
-                metadata["title"] = title
-            if description:
-                metadata["description"] = description
-            if tags:
-                try:
-                    metadata["tags"] = json.loads(tags)
-                except:
-                    metadata["tags"] = [t.strip() for t in tags.split(',') if t.strip()]
-            
-            # 保存文件到FileService
-            file_info = await files_service.save_file(user_id, file, metadata)
-            
-            # 获取文件路径 - 注意这里使用source_type判断
-            file_path = None
-            if file_info.get("source_type") == "local":
-                file_path = files_service.get_raw_file_path(user_id, file_info["id"])
-            
-            if not file_path or not file_path.exists():
-                raise HTTPException(status_code=404, detail="文件上传失败或不存在")
-            
-            # 创建SSE响应
-            return StreamingResponse(
-                stream_document_conversion(
-                    source=str(file_path),
-                    user_id=user_id,
-                    file_id=file_info["id"],
-                    converter=converter,
-                    files_service=files_service,
-                    retriever=retriever
-                ),
-                media_type="text/event-stream"
-            )
-            
-        except ValueError as e:
-            # 文件上传失败
-            logger.error(f"文件上传失败: {str(e)}")
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            # 其他错误
-            logger.error(f"上传并转换失败: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 本地文件转换 - 指定路径并返回markdown结果
-    @router.post("/oculith/local/convert")
-    async def local_convert(
-        path: str = Form(...),
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter),
-        files_service: FilesService = Depends(get_files_service),
-        retriever: LanceRetriever = Depends(get_retriever)
-    ):
-        """转换本地文件路径为Markdown - 支持SSE实时进度"""
-        user_id = token_data["user_id"]
-        logger.info(f"本地转换请求: 用户ID={user_id}, 路径={path}")
-        
-        # 验证文件存在
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
-        
-        try:
-            # 创建文件记录
-            filename = os.path.basename(path)
-            with open(path, "rb") as file_data:
-                file_info = await files_service.save_file(
-                    user_id=user_id,
-                    file=UploadFile(filename=filename, file=file_data),
-                    metadata={"source": "local_path", "original_path": path}
-                )
-            
-            # 创建SSE响应
-            return StreamingResponse(
-                stream_document_conversion(
-                    source=path,
-                    user_id=user_id,
-                    file_id=file_info["id"],
-                    converter=converter,
-                    files_service=files_service,
-                    retriever=retriever
-                ),
-                media_type="text/event-stream"
-            )
-            
-        except Exception as e:
-            logger.error(f"本地转换失败: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # 远程文件转换 - 指定URL并返回markdown结果
-    @router.post("/oculith/remote/convert")
-    async def remote_convert(
-        url: str = Form(...),
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter),
-        files_service: FilesService = Depends(get_files_service),
-        retriever: LanceRetriever = Depends(get_retriever)
-    ):
-        """转换远程URL为Markdown - 支持SSE实时进度"""
-        user_id = token_data["user_id"]
-        logger.info(f"远程转换请求: 用户ID={user_id}, URL={url}")
-        
-        # 验证URL格式
-        if not url.startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="无效的URL格式")
-        
-        try:
-            # 为远程URL创建文件记录
-            import urllib.parse
-            filename = os.path.basename(urllib.parse.urlparse(url).path) or "remote_document"
-            if not filename.strip():
-                filename = "remote_document.html"
-            
-            # 创建远程文件记录
-            file_info = await files_service.create_remote_file_record(
-                user_id=user_id,
-                url=url,
-                filename=filename,
-                metadata={"source": "url"}
-            )
-            
-            # 创建SSE响应
-            return StreamingResponse(
-                stream_document_conversion(
-                    source=url,
-                    user_id=user_id,
-                    file_id=file_info["id"],
-                    converter=converter,
-                    files_service=files_service,
-                    retriever=retriever
-                ),
-                media_type="text/event-stream"
-            )
-            
-        except Exception as e:
-            logger.error(f"远程转换失败: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=str(e))
-    
     # =================== 文件管理相关接口 ===================
 
     # 获取用户文件列表
@@ -579,7 +304,7 @@ def mount_docling_service(
             if file_info.get("source_type") == "local":
                 download_url = str(request.url_for("download_file", file_id=file_info["id"]))
             
-            # 适配新的元数据结构
+            # 直接使用扁平化结构，去掉custom_metadata
             result.append({
                 "id": file_info["id"],
                 "original_name": file_info["original_name"],
@@ -599,61 +324,15 @@ def mount_docling_service(
                 "source_type": file_info.get("source_type", "local"),
                 "source_url": file_info.get("source_url", ""),
                 "chunks_count": file_info.get("chunks_count", 0),
-                "custom_metadata": {k: v for k, v in file_info.items() 
-                                  if k not in ["id", "original_name", "size", "type", "extension", "path", 
-                                              "created_at", "updated_at", "status", "title", "description", 
-                                              "tags", "has_markdown", "has_chunks", "source_type", "source_url",
-                                              "chunks_count", "chunks"]}
+                # 保留所有其他字段，直接在顶层
+                **{k: v for k, v in file_info.items() 
+                  if k not in ["id", "original_name", "size", "type", "extension", "path", 
+                              "created_at", "updated_at", "status", "title", "description", 
+                              "tags", "has_markdown", "has_chunks", "source_type", "source_url",
+                              "chunks_count", "chunks"]}
             })
         
         return result
-    
-    # 单纯上传文件
-    @router.post("/oculith/local/upload")
-    async def upload_file(
-        request: Request,
-        file: UploadFile = File(...), 
-        title: Optional[str] = Form(None),
-        description: Optional[str] = Form(None),
-        tags: Optional[str] = Form(None),
-        token_data: Dict[str, Any] = Depends(verify_token),
-        files_service: FilesService = Depends(get_files_service)
-    ):
-        """上传文件（不进行转换）"""
-        user_id = token_data["user_id"]
-        
-        # 准备元数据
-        metadata = {}
-        if title:
-            metadata["title"] = title
-        if description:
-            metadata["description"] = description
-        if tags:
-            try:
-                metadata["tags"] = json.loads(tags)
-            except:
-                metadata["tags"] = [t.strip() for t in tags.split(',') if t.strip()]
-        
-        try:
-            file_info = await files_service.save_file(user_id, file, metadata)
-            
-            return {
-                "id": file_info["id"],
-                "original_name": file_info["original_name"],
-                "size": file_info["size"],
-                "type": file_info["type"],
-                "extension": file_info.get("extension", ""),
-                "created_at": file_info["created_at"],
-                "download_url": str(request.url_for("download_file", file_id=file_info["id"])),
-                "title": file_info.get("title", ""),
-                "description": file_info.get("description", ""),
-                "tags": file_info.get("tags", []),
-            }
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            logger.error(f"上传文件失败: {str(e)}")
-            raise HTTPException(status_code=500, detail="上传文件失败")
     
     # 获取文件信息
     @router.get("/oculith/files/{file_id}")
@@ -684,10 +363,11 @@ def mount_docling_service(
             "tags": file_info.get("tags", []),
             "converted": file_info.get("converted", False),
             "conversion_status": file_info.get("conversion_status", ""),
-            "custom_metadata": {k: v for k, v in file_info.items() 
-                               if k not in ["id", "original_name", "size", "type", "extension", "path", 
-                                           "created_at", "updated_at", "status", "title", "description", 
-                                           "tags", "markdown_content"]}
+            # 直接包含所有其他字段
+            **{k: v for k, v in file_info.items() 
+               if k not in ["id", "original_name", "size", "type", "extension", "path", 
+                           "created_at", "updated_at", "status", "title", "description", 
+                           "tags", "markdown_content"]}
         }
     
     # 获取已转换的Markdown内容
@@ -749,24 +429,16 @@ def mount_docling_service(
         if metadata.tags is not None:
             update_data["tags"] = metadata.tags
             
-        if metadata.custom_metadata:
-            update_data.update(metadata.custom_metadata)
+        # 直接更新额外字段
+        if metadata.extra_fields:
+            update_data.update(metadata.extra_fields)
         
         success = await files_service.update_metadata(user_id, file_id, update_data)
         if not success:
             raise HTTPException(status_code=404, detail="文件不存在或无法更新")
         
         # 获取更新后的文件信息
-        file_info = await files_service.get_file_meta(user_id, file_id)
-        
-        return {
-            "id": file_info["id"],
-            "original_name": file_info["original_name"],
-            "updated_at": file_info["updated_at"],
-            "title": file_info.get("title", ""),
-            "description": file_info.get("description", ""),
-            "tags": file_info.get("tags", [])
-        }
+        return await files_service.get_file_meta(user_id, file_id)
     
     # 删除文件
     @router.delete("/oculith/files/{file_id}")
@@ -839,74 +511,6 @@ def mount_docling_service(
         except Exception as e:
             logger.error(f"下载文件失败: {str(e)}")
             raise HTTPException(status_code=500, detail="下载文件失败")
-    
-    # 转换已上传的文件
-    @router.post("/oculith/files/{file_id}/convert", response_class=JSONResponse)
-    async def convert_file(
-        file_id: str,
-        token_data: Dict[str, Any] = Depends(verify_token),
-        converter: ObservableConverter = Depends(get_converter),
-        files_service: FilesService = Depends(get_files_service),
-        retriever: LanceRetriever = Depends(get_retriever)
-    ):
-        """转换已上传的文件为Markdown"""
-        user_id = token_data["user_id"]
-        
-        try:
-            # 获取文件信息
-            file_info = await files_service.get_file_meta(user_id, file_id)
-            if not file_info or file_info.get("status") != FileStatus.ACTIVE:
-                raise HTTPException(status_code=404, detail="文件不存在")
-            
-            # 获取文件路径
-            file_path = None
-            if file_info.get("source_type") == "local":
-                file_path = files_service.get_raw_file_path(user_id, file_id)
-            elif file_info.get("source_type") == "remote":
-                # 远程文件使用URL作为源
-                file_path = file_info.get("source_url")
-            
-            if not file_path:
-                raise HTTPException(status_code=404, detail="文件路径无效")
-            
-            if isinstance(file_path, Path) and not file_path.exists():
-                raise HTTPException(status_code=404, detail="文件不存在")
-            
-            # 使用convert_and_save处理文件
-            result = await converter.convert_and_save(
-                source=str(file_path) if isinstance(file_path, Path) else file_path,
-                user_id=user_id,
-                file_id=file_id,
-                retriever=retriever
-            )
-            
-            if result.get("success", False):
-                return {
-                    "success": True,
-                    "file_id": file_id,
-                    "original_name": file_info["original_name"],
-                    "content": result.get("content", ""),
-                    "content_type": "text/markdown"
-                }
-            else:
-                # 转换失败
-                error_msg = result.get("error", "未知错误")
-                
-                # 更新文件元数据，记录失败信息
-                await files_service.update_metadata(user_id, file_id, {
-                    "converted": False,
-                    "conversion_status": "ERROR",
-                    "conversion_time": time.time(),
-                    "conversion_error": error_msg
-                })
-                
-                raise HTTPException(status_code=500, detail=error_msg)
-                
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"转换文件失败: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"转换文件失败: {str(e)}")
     
     # 获取用户存储状态
     @router.get("/oculith/files/storage/status")
@@ -1129,6 +733,422 @@ def mount_docling_service(
             logger.error(f"文档检索失败: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"检索失败: {str(e)}")
 
+    # 新API端点：上传文件
+    @router.post("/oculith/files/upload")
+    async def upload_file(
+        request: Request,
+        file: UploadFile = File(...),
+        title: Optional[str] = Form(None),
+        description: Optional[str] = Form(None),
+        tags: Optional[str] = Form(None),
+        auto_process: bool = Form(False),  # 添加自动处理参数
+        token_data: Dict[str, Any] = Depends(verify_token),
+        files_service: FilesService = Depends(get_files_service),
+        converter: ObservableConverter = Depends(get_converter),
+        retriever: LanceRetriever = Depends(get_retriever),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """上传文件，可选择是否自动处理"""
+        user_id = token_data["user_id"]
+        logger.info(f"上传文件请求: 用户ID={user_id}, 文件名={file.filename}, 自动处理={auto_process}")
+        
+        try:
+            # 准备元数据
+            metadata = {}
+            if title:
+                metadata["title"] = title
+            if description:
+                metadata["description"] = description
+            if tags:
+                try:
+                    metadata["tags"] = json.loads(tags)
+                except:
+                    metadata["tags"] = [t.strip() for t in tags.split(',') if t.strip()]
+            
+            # 保存文件到FileService
+            file_info = await files_service.save_file(user_id, file, metadata)
+            
+            # 返回基本文件信息
+            result = {
+                "success": True,
+                "file_id": file_info["id"],
+                "original_name": file_info["original_name"],
+                "size": file_info["size"],
+                "type": file_info["type"],
+                "extension": file_info.get("extension", ""),
+                "created_at": file_info["created_at"],
+                "status": FileProcessStatus.UPLOADED.value,
+                "download_url": str(request.url_for("download_file", file_id=file_info["id"])),
+            }
+            
+            # 如果自动处理选项开启，添加处理任务
+            if auto_process:
+                # 确保队列管理器正在运行
+                await ensure_queue_manager_running(queue_manager)
+                
+                # 创建处理任务
+                task = FileTask(
+                    user_id=user_id,
+                    file_id=file_info["id"],
+                    task_type=TaskType.PROCESS_ALL,
+                    priority=0
+                )
+                
+                # 添加任务到队列
+                task_id = await queue_manager.add_task(task)
+                
+                # 添加任务信息到结果
+                result.update({
+                    "auto_process": True,
+                    "task_id": task_id,
+                    "task_type": TaskType.PROCESS_ALL.value,
+                    "process_status": FileProcessStatus.QUEUED.value,
+                    "process_stream_url": str(request.url_for("stream_file_processing", file_id=file_info["id"]))
+                })
+            
+            return result
+        except ValueError as e:
+            logger.error(f"文件上传失败: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"文件上传失败: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # 新API端点：文件处理流
+    @router.get("/oculith/files/{file_id}/process/stream")
+    async def stream_file_processing(
+        file_id: str,
+        token_data: Dict[str, Any] = Depends(verify_token),
+        files_service: FilesService = Depends(get_files_service),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """以SSE流的形式获取文件处理状态更新"""
+        user_id = token_data["user_id"]
+        
+        # 验证队列管理器状态
+        logger.info(f"SSE流启动: file_id={file_id}, 队列管理器状态={queue_manager.is_running}, 活动任务数={len(queue_manager.active_tasks)}")
+        
+        # 获取当前任务状态
+        file_tasks = await queue_manager.get_file_tasks(user_id, file_id)
+        if file_tasks:
+            logger.info(f"文件相关任务: {len(file_tasks)}个")
+            for task in file_tasks:
+                logger.info(f"任务状态: id={task['task_id']}, 类型={task['task_type']}, 状态={task['status']}")
+        
+        # 获取文件信息
+        file_info = await files_service.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            logger.error(f"文件不存在: {file_id}")
+            raise HTTPException(status_code=404, detail="文件不存在")
+        
+        logger.info(f"文件信息: {file_info}")
+        
+        async def status_stream():
+            # 发送初始状态
+            try:
+                initial_status = await queue_manager.get_file_status(user_id, file_id)
+                logger.info(f"SSE初始状态: {initial_status}")
+                yield format_sse({
+                    "type": "status",
+                    "file_id": file_id,
+                    "status": initial_status["status"],
+                    "timestamp": time.time()
+                }, event="status")
+                await asyncio.sleep(0.01)
+                
+                # 监控状态变化
+                last_status = initial_status["status"]
+                check_interval = 1.0  # 初始检查间隔
+                max_interval = 5.0    # 最大检查间隔
+                max_duration = 300    # 最大监控时间（秒）
+                start_time = time.time()
+                update_count = 0
+                
+                while time.time() - start_time < max_duration:
+                    try:
+                        current_status = await queue_manager.get_file_status(user_id, file_id)
+                        current = current_status["status"]
+                        update_count += 1
+                        
+                        if update_count % 5 == 0:  # 每5次输出一次日志，避免日志过多
+                            logger.info(f"SSE状态检查 #{update_count}: 当前={current}, 上次={last_status}, 运行时间={time.time() - start_time:.1f}秒")
+                        
+                        # 状态发生变化，发送更新
+                        if current != last_status:
+                            logger.info(f"SSE状态变化: {last_status} -> {current}")
+                            yield format_sse({
+                                "type": "status",
+                                "file_id": file_id,
+                                "status": current,
+                                "previous_status": last_status,
+                                "timestamp": time.time()
+                            }, event="status")
+                            await asyncio.sleep(0.01)
+                            last_status = current
+                            
+                            # 如果到达终态，结束流
+                            if current in [FileProcessStatus.COMPLETED.value, FileProcessStatus.FAILED.value]:
+                                logger.info(f"SSE检测到终态: {current}, 结束流")
+                                yield format_sse({
+                                    "type": "complete", 
+                                    "file_id": file_id,
+                                    "final_status": current,
+                                    "timestamp": time.time()
+                                }, event="complete")
+                                return
+                    
+                        # 提供定期更新，即使状态没有变化
+                        if (time.time() - start_time) % 10 < 1.0:  # 每10秒发送一次心跳
+                            logger.info(f"SSE发送心跳: status={current}")
+                            yield format_sse({
+                                "type": "heartbeat",
+                                "file_id": file_id,
+                                "status": current,
+                                "timestamp": time.time()
+                            }, event="heartbeat")
+                            await asyncio.sleep(0.01)
+                        
+                        # 等待下一次检查
+                        await asyncio.sleep(check_interval)
+                    except Exception as e:
+                        logger.error(f"SSE状态检查异常: {str(e)}")
+                        await asyncio.sleep(1.0)  # 出错后等待一秒
+                    
+                    # 根据情况调整检查间隔
+                    if current in [FileProcessStatus.QUEUED.value]:
+                        check_interval = min(check_interval * 1.2, max_interval)  # 排队中，逐渐增加间隔
+                    else:
+                        check_interval = 1.0  # 活跃处理中，保持较短间隔
+            except Exception as e:
+                logger.error(f"SSE流异常: {str(e)}", exc_info=True)
+                yield format_sse({
+                    "type": "error",
+                    "file_id": file_id,
+                    "message": f"监控状态时出错: {str(e)}",
+                    "timestamp": time.time()
+                }, event="error")
+        
+        # 返回SSE流响应
+        logger.info(f"返回SSE流响应: file_id={file_id}")
+        return StreamingResponse(
+            status_stream(),
+            media_type="text/event-stream"
+        )
+    
+    # 新API端点：处理文件 - 可以指定步骤
+    @router.post("/oculith/files/{file_id}/process")
+    async def process_file(
+        request: Request,
+        file_id: str,
+        step: Optional[str] = Form("all"),  # convert, chunk, index, all
+        priority: int = Form(0),
+        token_data: Dict[str, Any] = Depends(verify_token),
+        files_service: FilesService = Depends(get_files_service),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """添加文件处理任务到队列 - 统一处理入口"""
+        user_id = token_data["user_id"]
+        logger.info(f"处理文件请求: 用户ID={user_id}, 文件ID={file_id}, 步骤={step}, 优先级={priority}")
+        
+        # 确保队列管理器正在运行
+        await ensure_queue_manager_running(queue_manager)
+        
+        # 获取文件信息
+        file_info = await files_service.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            raise HTTPException(status_code=404, detail="文件不存在")
+        
+        # 确定任务类型
+        task_type = None
+        if step == "convert":
+            task_type = TaskType.CONVERT
+        elif step == "chunk":
+            task_type = TaskType.CHUNK
+        elif step == "index":
+            task_type = TaskType.INDEX
+        elif step == "all":
+            task_type = TaskType.PROCESS_ALL
+        else:
+            raise HTTPException(status_code=400, detail="无效的处理步骤")
+        
+        # 检查步骤依赖关系
+        if step == "chunk" and not file_info.get("has_markdown", False):
+            logger.warning(f"文件{file_id}尚未转换为Markdown，无法直接进行切片操作")
+            # 可以考虑自动切换为PROCESS_ALL，或返回错误
+        
+        if step == "index" and not file_info.get("has_chunks", False):
+            logger.warning(f"文件{file_id}尚未切片，无法直接进行索引操作")
+            # 可以考虑自动切换为适当步骤，或返回错误
+        
+        # 创建任务
+        task = FileTask(
+            user_id=user_id,
+            file_id=file_id,
+            task_type=task_type,
+            priority=priority
+        )
+        
+        # 添加任务到队列
+        task_id = await queue_manager.add_task(task)
+        
+        # 返回详细信息
+        return {
+            "success": True,
+            "file_id": file_id,
+            "original_name": file_info["original_name"],
+            "task_id": task_id,
+            "task_type": task_type.value,
+            "step": step,
+            "priority": priority,
+            "status": FileProcessStatus.QUEUED.value,
+            "message": "任务已添加到队列",
+            "process_stream_url": str(request.url_for("stream_file_processing", file_id=file_id))
+        }
+    
+    # 新API端点：任务状态查询
+    @router.get("/oculith/tasks/{task_id}")
+    async def get_task_status(
+        task_id: str,
+        token_data: Dict[str, Any] = Depends(verify_token),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """获取任务状态"""
+        # 获取任务状态
+        task_status = await queue_manager.get_task_status(task_id)
+        if not task_status:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        
+        # 只允许查看自己的任务
+        if task_status["user_id"] != token_data["user_id"]:
+            raise HTTPException(status_code=403, detail="无权访问此任务")
+        
+        return task_status
+    
+    # 新API端点：取消任务
+    @router.post("/oculith/tasks/{task_id}/cancel")
+    async def cancel_task(
+        task_id: str,
+        token_data: Dict[str, Any] = Depends(verify_token),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """取消任务"""
+        # 获取任务状态
+        task_status = await queue_manager.get_task_status(task_id)
+        if not task_status:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        
+        # 只允许取消自己的任务
+        if task_status["user_id"] != token_data["user_id"]:
+            raise HTTPException(status_code=403, detail="无权取消此任务")
+        
+        # 取消任务
+        success = await queue_manager.cancel_task(task_id)
+        if not success:
+            raise HTTPException(status_code=400, detail="无法取消任务，可能已完成或失败")
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "message": "任务已取消"
+        }
+
+    # 远程文件收藏与处理
+    @router.post("/oculith/files/bookmark-remote")
+    async def bookmark_remote_file(
+        request: Request,
+        url: str = Form(...),
+        filename: Optional[str] = Form(None),
+        title: Optional[str] = Form(None),
+        description: Optional[str] = Form(None),
+        tags: Optional[str] = Form(None),
+        auto_process: bool = Form(False),  # 是否自动开始处理
+        token_data: Dict[str, Any] = Depends(verify_token),
+        files_service: FilesService = Depends(get_files_service),
+        converter: ObservableConverter = Depends(get_converter),
+        retriever: LanceRetriever = Depends(get_retriever),
+        queue_manager: QueueManager = Depends(get_queue_manager)
+    ):
+        """收藏远程URL文件，可选择是否自动处理"""
+        user_id = token_data["user_id"]
+        logger.info(f"收藏远程文件请求: 用户ID={user_id}, URL={url}, 自动处理={auto_process}")
+        
+        # 验证URL格式
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="无效的URL格式")
+        
+        try:
+            # 确定文件名
+            if not filename:
+                import urllib.parse
+                filename = os.path.basename(urllib.parse.urlparse(url).path) or "remote_document"
+                if not filename.strip():
+                    filename = "remote_document.html"
+            
+            # 准备元数据
+            metadata = {}
+            if title:
+                metadata["title"] = title
+            if description:
+                metadata["description"] = description
+            if tags:
+                try:
+                    metadata["tags"] = json.loads(tags)
+                except:
+                    metadata["tags"] = [t.strip() for t in tags.split(',') if t.strip()]
+            
+            metadata["source"] = "url"
+            
+            # 创建远程文件记录
+            file_info = await files_service.create_remote_file_record(
+                user_id=user_id,
+                url=url,
+                filename=filename,
+                metadata=metadata
+            )
+            
+            # 返回基本文件信息
+            result = {
+                "success": True,
+                "file_id": file_info["id"],
+                "original_name": file_info["original_name"],
+                "type": file_info["type"],
+                "extension": file_info.get("extension", ""),
+                "created_at": file_info["created_at"],
+                "status": FileProcessStatus.UPLOADED.value,
+                "source_type": "remote",
+                "source_url": url
+            }
+            
+            # 如果自动处理选项开启，添加处理任务
+            if auto_process:
+                # 确保队列管理器正在运行
+                await ensure_queue_manager_running(queue_manager)
+                
+                # 创建处理任务
+                task = FileTask(
+                    user_id=user_id,
+                    file_id=file_info["id"],
+                    task_type=TaskType.PROCESS_ALL,
+                    priority=0
+                )
+                
+                # 添加任务到队列
+                task_id = await queue_manager.add_task(task)
+                
+                # 添加任务信息到结果
+                result.update({
+                    "auto_process": True,
+                    "task_id": task_id,
+                    "task_type": TaskType.PROCESS_ALL.value,
+                    "process_status": FileProcessStatus.QUEUED.value,
+                    "process_stream_url": str(request.url_for("stream_file_processing", file_id=file_info["id"]))
+                })
+            
+            return result
+        except Exception as e:
+            logger.error(f"收藏远程文件失败: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
     # 注册路由
     app.include_router(router, prefix=prefix)
 
@@ -1153,3 +1173,271 @@ async def delete_file_chunks_from_vectordb(user_id: str, file_id: str, retriever
     )
     
     logger.info(f"已从向量库删除文件所有切片: user_id={user_id}, file_id={file_id}")
+
+# 任务处理函数
+
+async def process_convert_task(
+    task: FileTask,
+    converter: ObservableConverter,
+    files_service: FilesService
+) -> Dict[str, Any]:
+    """处理文档转换任务"""
+    user_id = task.user_id
+    file_id = task.file_id
+    
+    try:
+        # 获取文件信息
+        file_info = await files_service.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            return {
+                "success": False,
+                "error": f"文件不存在或已删除: {file_id}"
+            }
+        
+        # 获取文件路径
+        file_path = None
+        if file_info.get("source_type") == "local":
+            file_path = files_service.get_raw_file_path(user_id, file_id)
+        elif file_info.get("source_type") == "remote":
+            # 远程文件使用URL作为源
+            file_path = file_info.get("source_url")
+        
+        if not file_path:
+            return {
+                "success": False,
+                "error": "文件路径无效"
+            }
+        
+        if isinstance(file_path, Path) and not file_path.exists():
+            return {
+                "success": False,
+                "error": "文件不存在"
+            }
+        
+        # 执行转换
+        doc_result = None
+        
+        # 收集所有更新
+        updates = []
+        async for update in converter.convert_async(
+            source=str(file_path) if isinstance(file_path, Path) else file_path,
+            doc_id=file_id,
+            raises_on_error=False
+        ):
+            updates.append(update)
+            if "document" in update:
+                doc_result = update
+        
+        # 处理转换结果
+        if doc_result and "document" in doc_result:
+            document = doc_result["document"]
+            
+            # 转换为Markdown
+            markdown_content = document.export_to_markdown()
+            
+            # 保存Markdown文件
+            await files_service.save_markdown_file(
+                user_id=user_id,
+                file_id=file_id,
+                markdown_content=markdown_content,
+                metadata={"conversion_status": "SUCCESS"}
+            )
+            
+            return {
+                "success": True,
+                "message": "文档成功转换为Markdown",
+                "markdown_length": len(markdown_content)
+            }
+        else:
+            # 处理失败
+            error_msg = "转换过程未产生有效文档"
+            for update in updates:
+                if update.get("stage") == "ERROR":
+                    error_msg = update.get("error", error_msg)
+            
+            # 更新文件元数据
+            await files_service.update_metadata(user_id, file_id, {
+                "converted": False,
+                "conversion_status": "ERROR",
+                "conversion_time": time.time(),
+                "conversion_error": error_msg
+            })
+            
+            return {
+                "success": False,
+                "error": error_msg
+            }
+    except Exception as e:
+        logger.error(f"处理转换任务异常: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"处理异常: {str(e)}"
+        }
+
+
+async def process_chunk_task(
+    task: FileTask,
+    converter: ObservableConverter,
+    files_service: FilesService
+) -> Dict[str, Any]:
+    """处理文档切片任务"""
+    user_id = task.user_id
+    file_id = task.file_id
+    
+    try:
+        # 获取文件信息
+        file_info = await files_service.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            return {
+                "success": False,
+                "error": f"文件不存在或已删除: {file_id}"
+            }
+        
+        # 检查是否已经转换为Markdown
+        if not file_info.get("has_markdown", False):
+            return {
+                "success": False,
+                "error": "文件尚未转换为Markdown，请先执行转换任务"
+            }
+        
+        # 获取Markdown内容
+        markdown_content = await files_service.get_markdown_content(user_id, file_id)
+        
+        # 使用HybridChunker进行文本切片
+        from docling.chunking import HybridChunker
+        chunker = HybridChunker()
+        
+        # 简单的文本切片实现
+        chunks = []
+        chunk_size = 1000  # 自定义切片大小
+        for i in range(0, len(markdown_content), chunk_size):
+            chunk_text = markdown_content[i:i+chunk_size]
+            chunks.append({
+                "content": chunk_text,
+                "metadata": {
+                    "chunk_index": i // chunk_size,
+                    "file_id": file_id,
+                    "original_name": file_info.get("original_name", ""),
+                    "source_type": file_info.get("source_type", "local"),
+                    "user_id": user_id  # 添加用户ID方便向量存储过滤
+                }
+            })
+        
+        # 保存切片
+        await files_service.save_chunks(
+            user_id=user_id,
+            file_id=file_id,
+            chunks=chunks
+        )
+        
+        return {
+            "success": True,
+            "message": "文档成功切片",
+            "chunks_count": len(chunks)
+        }
+    except Exception as e:
+        logger.error(f"处理切片任务异常: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"处理异常: {str(e)}"
+        }
+
+
+async def process_index_task(
+    task: FileTask,
+    files_service: FilesService,
+    retriever: LanceRetriever
+) -> Dict[str, Any]:
+    """处理向量索引任务"""
+    user_id = task.user_id
+    file_id = task.file_id
+    
+    try:
+        # 获取文件信息
+        file_info = await files_service.get_file_meta(user_id, file_id)
+        if not file_info or file_info.get("status") != FileStatus.ACTIVE:
+            return {
+                "success": False,
+                "error": f"文件不存在或已删除: {file_id}"
+            }
+        
+        # 检查是否已经切片
+        if not file_info.get("has_chunks", False):
+            return {
+                "success": False,
+                "error": "文件尚未切片，请先执行切片任务"
+            }
+        
+        # 向量化所有切片
+        indexed_chunks = 0
+        total_chunks = file_info.get("chunks_count", 0)
+        skipped_chunks = 0
+        
+        async for chunk_data in files_service.iter_chunks_content(user_id, file_id):
+            try:
+                add_result = await retriever.add(
+                    texts=chunk_data["content"],
+                    user_id=user_id,
+                    metadatas={
+                        "file_id": file_id,
+                        "chunk_index": chunk_data.get("chunk_index", 0),
+                        **chunk_data.get("metadata", {})
+                    }
+                )
+                
+                if isinstance(add_result, dict):
+                    indexed_chunks += add_result.get("added", 0)
+                    skipped_chunks += add_result.get("skipped", 0)
+            except Exception as e:
+                logger.error(f"向量化切片失败: {str(e)}")
+                skipped_chunks += 1
+        
+        # 尝试创建索引
+        await retriever.ensure_index()
+        
+        # 更新文件元数据
+        await files_service.update_metadata(user_id, file_id, {
+            "indexed": True,
+            "indexed_chunks": indexed_chunks,
+            "skipped_chunks": skipped_chunks,
+            "indexing_time": time.time()
+        })
+        
+        return {
+            "success": True,
+            "message": "文档成功索引",
+            "indexed_chunks": indexed_chunks,
+            "total_chunks": total_chunks,
+            "skipped_chunks": skipped_chunks
+        }
+    except Exception as e:
+        logger.error(f"处理索引任务异常: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"处理异常: {str(e)}"
+        }
+
+
+async def process_all_task(
+    task: FileTask,
+    converter: ObservableConverter,
+    files_service: FilesService,
+    retriever: LanceRetriever
+) -> Dict[str, Any]:
+    """处理完整的文档流程"""
+    user_id = task.user_id
+    file_id = task.file_id
+    
+    # 1. 执行转换
+    convert_result = await process_convert_task(task, converter, files_service)
+    if not convert_result.get("success", False):
+        return convert_result
+    
+    # 2. 执行切片
+    chunk_result = await process_chunk_task(task, converter, files_service)
+    if not chunk_result.get("success", False):
+        return chunk_result
+    
+    # 3. 执行索引
+    index_result = await process_index_task(task, files_service, retriever)
+    return index_result
