@@ -1,6 +1,6 @@
 [project]
 name = "oculith"
-version = "0.1.2"
+version = "0.1.3"
 description = "Document OCR based on docling"
 authors = [
     {name = "arcstep",email = "43801@qq.com"}

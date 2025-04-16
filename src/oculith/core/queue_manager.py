@@ -273,7 +273,7 @@ class QueueManager:
             
             # 打印工作循环状态
             if worker_cycle % 10 == 1 or current_time - last_active_time > 5:
-                logger.info(f"工作进程循环 #{worker_cycle}, 上次活动: {current_time - last_active_time:.1f}秒前")
+                # logger.info(f"工作进程循环 #{worker_cycle}, 上次活动: {current_time - last_active_time:.1f}秒前")
                 last_active_time = current_time
             
             try:
