@@ -8,22 +8,8 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    "fastapi>=0.68.0",
-    "uvicorn>=0.15.0",
-    "python-multipart>=0.0.5",
-    "pydantic>=1.8.2",
-    "python-dotenv>=0.19.0",
-    "loguru>=0.5.3",
-    "voidring>=0.1.0",
-    "torch (>=2.0.0,<2.3)",
+    "voidrail (>=0.1.7,<0.2.0)",
     "docling>=2.30.0",
-    "litellm (>=1.66.0,<2.0.0)",
-    "chromadb (>=1.0.4,<2.0.0)",
-    "aiofiles (>=24.1.0,<25.0.0)",
-    "diskcache (>=5.6.3,<6.0.0)",
-    "soulseal (>=0.1.9,<0.2.0)",
-    "pyarrow (>=19.0.1,<20.0.0)",
-    "lancedb (>=0.21.2,<0.22.0)",
 ]
 
 [build-system]
@@ -37,9 +23,4 @@ packages = [
 
 [tool.poetry.scripts]
 oculith = "oculith.__main__:main"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.3.5"
-pytest-asyncio = "^0.26.0"
-httpx = "^0.28.1"
 
