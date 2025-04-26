@@ -3,6 +3,9 @@ from docling_core.types.doc.document import DoclingDocument
 from voidrail import ServiceDealer, service_method
 
 import logging
+import tempfile
+import base64
+import os
 
 def save_markdown(document: DoclingDocument, path: str) -> str:
     """
@@ -46,33 +49,59 @@ class SimpleDocling(ServiceDealer):
         self.logger.setLevel(logger_level)
 
     @service_method
-    def local_convert(self, from_path: str, format: str = "markdown") -> str:
+    def convert(
+        self,
+        content: str,
+        content_type: str = "url",
+        file_type: str = "",
+        output_format: str = "markdown"
+    ) -> str:
         """
-        Convert a local document to markdown or text or html.
+        统一的转换方法，支持网络资源和base64编码的文件内容。
+        
+        参数:
+            content: URL或base64编码的文件内容
+            output_format: 输出格式，支持"markdown"、"text"和"html"
+            content_type: 内容类型，"url"或"base64"
+            file_type: 文件类型（扩展名），仅在处理base64编码时使用
         """
-        result = self.converter.convert(from_path)
-        self.logger.info(result)
-        if format == "markdown":
+        if content_type == "base64":
+            # 处理base64编码的文件内容
+            try:
+                # 解码base64内容
+                decoded_content = base64.b64decode(content)
+                
+                # 创建临时文件
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}" if file_type else "") as temp_file:
+                    temp_path = temp_file.name
+                    temp_file.write(decoded_content)
+                
+                # 转换文件
+                try:
+                    result = self.converter.convert(temp_path)
+                    self.logger.info(f"成功转换base64编码文件")
+                finally:
+                    # 确保删除临时文件
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+            except Exception as e:
+                self.logger.error(f"处理base64内容时出错: {str(e)}")
+                raise ValueError(f"处理base64内容失败: {str(e)}")
+        else:
+            # 处理URL
+            try:
+                result = self.converter.convert(content)
+                self.logger.info(f"成功转换URL: {content}")
+            except Exception as e:
+                self.logger.error(f"处理URL时出错: {str(e)}")
+                raise ValueError(f"处理URL失败: {str(e)}")
+        
+        # 根据请求的格式返回结果
+        if output_format == "markdown":
             yield result.document.export_to_markdown()
-        elif format == "text":
+        elif output_format == "text":
             yield result.document.export_to_text()
-        elif format == "html":
+        elif output_format == "html":
             yield result.document.export_to_html()
         else:
-            raise ValueError(f"Invalid format: {format}")
-    
-    @service_method
-    def remote_convert(self, web_path: str, format: str = "markdown") -> str:
-        """
-        Convert a web document to markdown or text or html.
-        """
-        result = self.converter.convert(web_path)
-        self.logger.info(result)
-        if format == "markdown":
-            yield result.document.export_to_markdown()
-        elif format == "text":
-            yield result.document.export_to_text()
-        elif format == "html":
-            yield result.document.export_to_html()
-        else:
-            raise ValueError(f"Invalid format: {format}")
+            raise ValueError(f"不支持的输出格式: {foroutput_formatmat}")

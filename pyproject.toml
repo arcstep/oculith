@@ -1,25 +1,21 @@
-[project]
+[tool.poetry]
 name = "oculith"
 version = "0.1.3"
 description = "Document OCR based on docling"
-authors = [
-    {name = "arcstep",email = "43801@qq.com"}
-]
+authors = ["arcstep <43801@qq.com>"]
 readme = "README.md"
-requires-python = ">=3.11,<4.0"
-dependencies = [
-    "voidrail (>=0.1.7,<0.2.0)",
-    "docling>=2.30.0",
+packages = [
+    { include = "oculith", from = "src" }
 ]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+docling = ">=2.30.0"
+voidrail = {path = "../voidrail", develop = true}
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
-
-[tool.poetry]
-packages = [
-    { include = "oculith", from = "src" }
-]
 
 [tool.poetry.scripts]
 oculith = "oculith.__main__:main"

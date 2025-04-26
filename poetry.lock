@@ -3596,22 +3596,24 @@ zstd = ["zstandard (>=0.18.0)"]
 
 [[package]]
 name = "voidrail"
-version = "0.1.7"
+version = "0.1.8"
 description = ""
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version == \"3.11\" or python_version >= \"3.12\""
-files = [
-    {file = "voidrail-0.1.7-py3-none-any.whl", hash = "sha256:896eebc19b6bb51c47cc54f33b3f1e8533e56243118126c22a304f3e34be6a37"},
-    {file = "voidrail-0.1.7.tar.gz", hash = "sha256:d6bda9770aa503890df841ae3fa5179f2c7b68e6e756aa666b4b70452432df86"},
-]
+files = []
+develop = true
 
 [package.dependencies]
 async-timeout = ">=5.0.1,<6.0.0"
 click = ">=8.1.8,<9.0.0"
 pydantic = ">=2.11.3,<3.0.0"
 pyzmq = ">=26.4.0,<27.0.0"
+
+[package.source]
+type = "directory"
+url = "../voidrail"
 
 [[package]]
 name = "xlsxwriter"
@@ -3629,4 +3631,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "6b76d201df3540245864345d6cdff3262de52f96bc2ddbdc2d8075e3516e9bed"
+content-hash = "ace8a9a5963c04e6fb53215978452b4423f92fab4574c9abdfccc7e8e47e529e"
