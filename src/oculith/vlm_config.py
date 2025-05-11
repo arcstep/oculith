@@ -12,8 +12,10 @@ from typing import Dict, Any, Optional
 
 from docling.datamodel.pipeline_options import (
     ApiVlmOptions,
+    HuggingFaceVlmOptions,
     ResponseFormat,  # 导入枚举
     VlmPipelineOptions,
+    InferenceFramework,
 )
 from dotenv import load_dotenv, find_dotenv
 
@@ -21,76 +23,16 @@ load_dotenv(find_dotenv(), override=True)
 
 logger = logging.getLogger(__name__)
 
-def read_env_configs() -> Dict[str, Any]:
-    """从环境变量读取VLM配置参数"""
-    # 基础配置
-    config = {
-        # 默认提供商为空，必须显式指定
-        "provider": os.environ.get("VLM_PROVIDER", "").lower(),
-        # 核心配置，不提供默认值
-        "api_url": os.environ.get("VLM_API_URL", ""),
-        "api_key": os.environ.get("VLM_API_KEY", ""),
-        "model_name": os.environ.get("VLM_MODEL_NAME", ""),
-        "prompt_template": os.environ.get("VLM_PROMPT_TEMPLATE", ""),
-        # 非关键配置，提供默认值
-        "timeout": int(os.environ.get("VLM_TIMEOUT", "90")),
-    }
-    
-    # OpenAI兼容接口特定配置
-    config.update({
-        # 认证方式: bearer, api_key, custom, none
-        "auth_type": os.environ.get("VLM_AUTH_TYPE", "bearer").lower(),
-        # 认证头名称，默认为Authorization
-        "auth_header": os.environ.get("VLM_AUTH_HEADER", "Authorization"),
-        # 认证值前缀，默认为Bearer
-        "auth_prefix": os.environ.get("VLM_AUTH_PREFIX", "Bearer"),
-        # 完整认证值，如果提供则优先使用
-        "auth_value": os.environ.get("VLM_AUTH_VALUE", ""),
-    })
-    
-    # 读取响应格式配置
-    config["response_format"] = os.environ.get("VLM_RESPONSE_FORMAT", "")
-    
-    # 解析额外参数
-    additional_params_str = os.environ.get("VLM_ADDITIONAL_PARAMS", "{}")
-    try:
-        config["additional_params"] = json.loads(additional_params_str)
-    except json.JSONDecodeError:
-        logger.warning(f"无法解析VLM_ADDITIONAL_PARAMS: {additional_params_str}，使用空字典")
-        config["additional_params"] = {}
-    
-    # 解析完整的请求头
-    headers_str = os.environ.get("VLM_HEADERS", "{}")
-    try:
-        config["headers"] = json.loads(headers_str)
-    except json.JSONDecodeError:
-        logger.warning(f"无法解析VLM_HEADERS: {headers_str}，使用空字典")
-        config["headers"] = {}
-    
-    return config
 
 def configure_openai(config: Dict[str, Any]) -> ApiVlmOptions:
     """配置OpenAI及兼容接口的视觉模型"""
     # OpenAI默认配置
-    DEFAULT_OPENAI = {
+    DEFAULT_CONFIG = {
         "api_url": "https://api.openai.com/v1/chat/completions",
         "model_name": "gpt-4o",
         "prompt_template": "Extract and transcribe all text content from this image, preserving the layout as much as possible. Format the output in markdown."
     }
-    
-    # 通义千问的默认配置
-    DEFAULT_DASHSCOPE = {
-        "api_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        "model_name": "qwen-vl-plus",
-        "prompt_template": "提取并转录图像中的所有文本内容，尽可能保留原始布局，使用markdown格式输出。"
-    }
-    
-    # 判断是否为通义千问
-    is_dashscope = "dashscope" in config.get("api_url", "").lower()
-    
-    # 选择默认配置
-    DEFAULT_CONFIG = DEFAULT_DASHSCOPE if is_dashscope else DEFAULT_OPENAI
-    
+        
     # 获取配置，优先使用环境变量，否则使用默认值
     api_url = config.get("api_url") or DEFAULT_CONFIG["api_url"]
     api_key = config.get("api_key")
@@ -200,7 +142,7 @@ def configure_gemini(config: Dict[str, Any]) -> ApiVlmOptions:
 def dashscope_vlm_options(
     api_key: str,
     model: str = "qwen-vl-plus",
-    prompt: str = "提取并转录图像中的所有文本内容，尽可能保留原始布局，使用markdown格式输出。"
+    prompt: str = "提取并转录图像中的所有文本内容，尽可能保留原始布局，使用markdown格式输出。直接输出markdown内容，不要添加任何其他内容。"
 ) -> ApiVlmOptions:
     """配置通义千问视觉模型"""
     if not api_key:
@@ -249,6 +191,31 @@ def ollama_vlm_options(
         response_format=ResponseFormat.MARKDOWN,
     )
 
+def huggingface_vlm_options(
+    repo_id: str = "ibm-granite/granite-vision-3.1-2b-preview",
+    prompt: str = "OCR this image.",
+    inference_framework: str = "transformers"
+) -> HuggingFaceVlmOptions:
+    """配置HuggingFace本地模型"""
+    if not repo_id:
+        raise ValueError("使用HuggingFace需要提供模型ID")
+    
+    # 转换框架字符串为枚举值
+    if inference_framework.lower() == "mlx":
+        framework = InferenceFramework.MLX
+    elif inference_framework.lower() == "openai":
+        framework = InferenceFramework.OPENAI
+    else:
+        framework = InferenceFramework.TRANSFORMERS
+    
+    # 简化：直接使用MARKDOWN格式，移除不必要的条件判断
+    return HuggingFaceVlmOptions(
+        repo_id=repo_id,
+        prompt=prompt,
+        response_format=ResponseFormat.MARKDOWN,
+        inference_framework=framework,
+    )
+
 def get_vlm_pipeline_options(
     provider: str = None,
     model: str = None,
@@ -258,12 +225,12 @@ def get_vlm_pipeline_options(
     """获取VLM管道选项
     
     参数:
-        provider: 模型提供商 (dashscope, ollama, openai)
-        model: 模型名称
+        provider: 模型提供商 (dashscope, ollama, openai, huggingface)
+        model: 模型名称或仓库ID
         prompt: 提示词
         api_key: API密钥
     """
-    # 从环境变量获取默认值
+    # 从环境变量获取默认值，默认使用ollama
     provider = provider or os.environ.get("VLM_PROVIDER", "ollama").lower()
     api_key = api_key or os.environ.get("VLM_API_KEY", "")
     model = model or os.environ.get("VLM_MODEL_NAME", "")
@@ -271,13 +238,35 @@ def get_vlm_pipeline_options(
     
     pipeline_options = VlmPipelineOptions(enable_remote_services=True)
     
-    if provider == "dashscope":
-        pipeline_options.vlm_options = dashscope_vlm_options(api_key, model, prompt)
-    elif provider == "openai":
-        pipeline_options.vlm_options = openai_vlm_options(api_key, model, prompt)
-    elif provider == "ollama":
-        pipeline_options.vlm_options = ollama_vlm_options(model, prompt)
+    if provider == "huggingface":
+        # 从环境变量获取HuggingFace特定配置
+        inference_framework = os.environ.get("VLM_INFERENCE_FRAMEWORK", "transformers")
+        kwargs = {}
+        if model:
+            kwargs["repo_id"] = model
+        if prompt:
+            kwargs["prompt"] = prompt
+        if inference_framework:
+            kwargs["inference_framework"] = inference_framework
+        pipeline_options.vlm_options = huggingface_vlm_options(**kwargs)
+        # HuggingFace本地模型不需要远程服务
+        pipeline_options.enable_remote_services = False
     else:
-        raise ValueError(f"不支持的视觉模型提供商: {provider}")
+        kwargs = {}
+        if api_key:
+            kwargs["api_key"] = api_key
+        if model:
+            kwargs["model"] = model
+        if prompt:
+            kwargs["prompt"] = prompt
+
+        if provider == "dashscope":
+            pipeline_options.vlm_options = dashscope_vlm_options(**kwargs)
+        elif provider == "openai":
+            pipeline_options.vlm_options = openai_vlm_options(**kwargs)
+        elif provider == "ollama":
+            pipeline_options.vlm_options = ollama_vlm_options(**kwargs)
+        else:
+            raise ValueError(f"不支持的视觉模型提供商: {provider}")
     
     return pipeline_options

@@ -8,6 +8,7 @@ import json
 import base64
 from docling_core.types.doc import ImageRefMode, PictureItem
 import io
+import time
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -33,7 +34,7 @@ def convert(
     content_type: str = "auto",
     file_type: str = "",
     document_id: Optional[str] = None,
-    pipeline_type: Literal["standard", "simple", "vlm"] = "auto",
+    pipeline: Literal["standard", "simple", "vlm"] = "auto",
     ocr: Optional[str] = None,
     language: str = "zh",
     return_type: Literal["markdown", "markdown_embedded", "dict_with_images"] = "dict_with_images",
@@ -49,7 +50,7 @@ def convert(
         content_type: 内容类型(auto/file/url/base64)
         file_type: 文件类型(pdf/docx等)
         document_id: 文档ID
-        pipeline_type: 处理管道类型 (auto自动检测，standard适用于PDF/图片，simple适用于其他格式，vlm使用视觉语言模型)
+        pipeline: 处理管道类型 (auto自动检测，standard适用于PDF/图片，simple适用于其他格式，vlm使用视觉语言模型)
         ocr: OCR引擎名称，None表示根据文件类型自动决定
         language: 语言代码
         return_type: 返回类型
@@ -58,11 +59,20 @@ def convert(
         advanced_features: 高级特性控制
         output_dir: 输出文件路径
     """
+    model_info = {
+        "pipeline": pipeline,
+        "provider": None,
+        "model": None,
+        "ocr_engine": ocr,
+    }
+    
     try:
         # 获取文档ID
         if not document_id:
             content_hash = hashlib.md5(content.encode() if isinstance(content, str) else content).hexdigest()
             document_id = f"{content_hash}"
+        
+        logger.info(f"开始处理文档 ID: {document_id}, 管道类型: {pipeline}, OCR引擎: {ocr}")
         
         # 使用convert_file预处理 - 这将准备文件并识别格式
         temp_file_path = None
@@ -70,9 +80,10 @@ def convert(
         
         try:
             temp_file_path, is_temp_file = prepare_file(content, content_type, file_type)
+            logger.info(f"文件准备完成: {temp_file_path}")
             
             # 根据管道类型配置选项
-            if pipeline_type in ["standard", "auto"]:
+            if pipeline in ["standard", "auto"]:
                 # 对于标准和自动模式，创建带有正确选项的PDF转换器
                 pipeline_options = PdfPipelineOptions()
                 pipeline_options.images_scale = images_scale
@@ -98,35 +109,64 @@ def convert(
                             setattr(pipeline_options, feature, enabled)
                             
                 # 直接使用配置好的选项创建新的转换器
+                logger.info(f"创建PDF转换器，OCR引擎: {ocr}, 语言: {language}")
                 converter = get_pdf_converter(
                     ocr=ocr, 
                     language=language, 
                     pipeline_options=pipeline_options
                 )
-            elif pipeline_type == "simple":
+                model_info["ocr_engine"] = ocr or "默认"
+                model_info["pipeline"] = "standard"
+                
+            elif pipeline == "simple":
                 if file_type:
                     # 根据文件扩展名获取格式
+                    logger.info(f"创建Simple转换器，文件类型: {file_type}")
                     converter = get_simple_converter(file_type)
                 else:
                     # 默认简单转换器
+                    logger.info("创建默认Simple转换器")
                     converter = get_simple_converter()
-            elif pipeline_type == "vlm":
+                model_info["pipeline"] = "simple"
+                
+            elif pipeline == "vlm":
+                logger.info("创建VLM转换器")
+                # 获取环境变量中的提供商和模型信息
+                provider = os.environ.get("VLM_PROVIDER", "ollama")
+                model = os.environ.get("VLM_MODEL_NAME", "")
+                
+                logger.info(f"使用VLM服务，提供商: {provider}, 模型: {model or '默认'}")
+                
                 converter = get_vlm_converter(
-                    provider=os.environ.get("VLM_PROVIDER").lower(),
-                    model=os.environ.get("VLM_MODEL_NAME"),
-                    prompt=os.environ.get("VLM_PROMPT"),
-                    api_key=os.environ.get("VLM_API_KEY")
+                    provider=provider,
+                    model=model,
+                    prompt=None,
+                    api_key=None
                 )
+                
+                model_info["pipeline"] = "vlm"
+                model_info["provider"] = provider
+                model_info["model"] = model or "默认模型"
+                
             else:
                 # 自动检测
                 ext = Path(temp_file_path).suffix.lower()[1:] if Path(temp_file_path).suffix else file_type
                 if ext in ["pdf", "jpg", "jpeg", "png", "gif", "bmp", "tiff"]:
+                    logger.info(f"自动检测为图像/PDF文件，创建PDF转换器")
                     converter = get_pdf_converter(ocr=ocr, language=language)
+                    model_info["pipeline"] = "standard"
+                    model_info["ocr_engine"] = ocr or "默认"
                 else:
+                    logger.info(f"自动检测为其他格式，创建Simple转换器")
                     converter = get_simple_converter(ext)
+                    model_info["pipeline"] = "simple"
             
             # 执行转换
+            logger.info(f"开始文档转换: {temp_file_path}")
+            start_time = time.time()
             res = converter.convert(temp_file_path)
+            conversion_time = time.time() - start_time
+            logger.info(f"文档转换完成，耗时: {conversion_time:.2f}秒")
             
             # 初始化result变量，避免未定义错误
             if return_type == "dict_with_images":
@@ -134,13 +174,16 @@ def convert(
                 if output_dir:
                     output_dir_path = Path(output_dir)
                     output_dir_path.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"提取图像和Markdown到目录: {output_dir}")
                     result = extract_images_with_markdown(res, output_dir)
                 else:
                     # 无输出路径时，只在内存中处理
+                    logger.info("提取图像和Markdown到内存")
                     result = extract_images_with_markdown(res, None)
             else:
                 # 处理单文件输出
                 markdown_type = ImageRefMode.EMBEDDED if return_type == "markdown_embedded" else ImageRefMode.REFERENCED
+                logger.info(f"导出Markdown，类型: {return_type}")
                 markdown_content = res.document.export_to_markdown(image_mode=markdown_type)
                 
                 # 构建基本结果
@@ -156,6 +199,7 @@ def convert(
                     # 判断是文件还是目录
                     if output_path.suffix:  # 有后缀名，当作文件处理
                         output_path.parent.mkdir(parents=True, exist_ok=True)
+                        logger.info(f"保存Markdown到文件: {output_path}")
                         with open(output_path, "w", encoding="utf-8") as f:
                             f.write(markdown_content)
                         result["output_file"] = str(output_path)
@@ -163,17 +207,21 @@ def convert(
                         output_path.mkdir(parents=True, exist_ok=True)
                         doc_filename = Path(res.input.file).stem
                         md_filename = output_path / f"{doc_filename}.md"
+                        logger.info(f"保存Markdown到文件: {md_filename}")
                         with open(md_filename, "w", encoding="utf-8") as f:
                             f.write(markdown_content)
                         result["output_file"] = str(md_filename)
-                    
-                    logger.info(f"Markdown内容已保存至: {result['output_file']}")
+            
+            # 添加模型信息到结果中
+            result["model_info"] = model_info
+            logger.info(f"处理完成，文档ID: {document_id}")
             
             return result
         
         finally:
             # 只删除临时创建的文件
             if temp_file_path and os.path.exists(temp_file_path) and is_temp_file:
+                logger.debug(f"清理临时文件: {temp_file_path}")
                 os.unlink(temp_file_path)
 
     except Exception as e:
@@ -183,7 +231,8 @@ def convert(
             "error": True,
             "message": str(e),
             "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
+            "traceback": traceback.format_exc(),
+            "model_info": model_info  # 在错误情况下也返回模型信息
         }
 
 def get_pdf_converter(ocr: Optional[str] = None, language: str = "zh", 
@@ -253,12 +302,22 @@ def get_vlm_converter(
     """获取基于视觉语言模型的转换器"""
     from .vlm_config import get_vlm_pipeline_options
     
+    # 从环境变量读取缺失值，默认使用ollama
+    provider = provider or os.environ.get("VLM_PROVIDER", "ollama")
+    model = model or os.environ.get("VLM_MODEL_NAME", "")
+    prompt = prompt or os.environ.get("VLM_PROMPT", "")
+    api_key = api_key or os.environ.get("VLM_API_KEY", "")
+    
+    logger.info(f"配置VLM转换器 - 提供商: {provider}, 模型: {model or '默认'}")
+    
     vlm_options = get_vlm_pipeline_options(
         provider=provider,
         model=model,
         prompt=prompt,
         api_key=api_key
     )
+    
+    logger.info(f"VLM选项已配置, 是否使用远程服务: {vlm_options.enable_remote_services}")
     
     return DocumentConverter(
         format_options={
