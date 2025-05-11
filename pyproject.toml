@@ -15,6 +15,8 @@ voidrail = {path = "../voidrail", develop = true}
 celery = {extras = ["redis"], version = "^5.5.2"}
 click = "^8.1.8"
 tiktoken = "^0.9.0"
+tesserocr = "^2.8.0"
+ocrmac = "^1.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"
@@ -25,4 +27,3 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
 oculith = "oculith.__main__:main"
-

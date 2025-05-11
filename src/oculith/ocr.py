@@ -2,19 +2,21 @@
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Union, List
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
     RapidOcrOptions,
     TesseractOcrOptions,
-    TesseractCliOcrOptions
+    TesseractCliOcrOptions,
+    OcrMacOptions,
+    EasyOcrOptions
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 from .parquet import save_to_parquet
-from .common import convert_pdf
+from .common import convert_file
 
 # 日志
 logger = logging.getLogger(__name__)
@@ -25,14 +27,18 @@ def ocr_text_from_document(
     file_type: str = "",
     output_path: Optional[str] = None,
     engine: str = "rapid",
-    language: str = "auto"
+    language: Union[str, List[str]] = "zh"
 ) -> str:
-    """使用OCR处理文档"""
+    """使用OCR处理文档
+    
+    参数:
+        language: 语言代码或语言代码列表，'auto'表示自动检测，'zh'表示中文
+    """
     # 获取OCR转换器
     converter = get_ocr_converter(engine, language)
     
     # 转换文档
-    res = convert_pdf(content, content_type, file_type, converter)
+    res = convert_file(content, content_type, file_type, converter)
     
     # 保存为parquet
     if not output_path:
@@ -47,8 +53,13 @@ def ocr_text_from_document(
     
     return output_path
 
-def get_ocr_converter(engine: str, language: str = "auto") -> DocumentConverter:
-    """根据指定的引擎获取OCR转换器"""
+def get_ocr_converter(engine: str, language: Union[str, List[str]] = "zh") -> DocumentConverter:
+    """根据指定的引擎获取OCR转换器
+    
+    参数:
+        engine: OCR引擎名称
+        language: 语言代码或语言代码列表，'auto'表示自动检测，'zh'表示中文
+    """
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
     pipeline_options.images_scale = 2.0
@@ -56,37 +67,45 @@ def get_ocr_converter(engine: str, language: str = "auto") -> DocumentConverter:
     
     # 配置OCR选项
     if engine == "rapid":
-        # RapidOCR配置
-        try:
-            from huggingface_hub import snapshot_download
-            download_path = snapshot_download(repo_id="SWHL/RapidOCR")
-            
-            lang_prefix = "en" if language == "en" else "ch"
-            det_path = os.path.join(download_path, "PP-OCRv4", f"{lang_prefix}_PP-OCRv3_det_infer.onnx")
-            rec_path = os.path.join(download_path, "PP-OCRv4", f"{lang_prefix}_PP-OCRv4_rec_infer.onnx")
-            cls_path = os.path.join(download_path, "PP-OCRv3", "ch_ppocr_mobile_v2.0_cls_train.onnx")
-            
-            pipeline_options.ocr_options = RapidOcrOptions(
-                det_model_path=det_path,
-                rec_model_path=rec_path,
-                cls_model_path=cls_path
-            )
-        except Exception as e:
-            logger.error(f"RapidOCR配置失败: {e}")
-            # 回退到Tesseract
-            pipeline_options.ocr_options = TesseractOcrOptions(lang=[language])
+        # RapidOCR已默认内置中英文支持
+        ocr_options = RapidOcrOptions()
+        # 默认就支持中英文，无需特别设置
+        ocr_options.force_full_page_ocr = True
+        pipeline_options.ocr_options = ocr_options
+    
+    elif engine == "mac":
+        # Mac OCR 支持
+        lang_codes = ["zh-Hans"] if language == "zh" else (
+            language if isinstance(language, list) else [language]
+        )
+        ocr_options = OcrMacOptions(lang=lang_codes)
+        ocr_options.force_full_page_ocr = True
+        pipeline_options.ocr_options = ocr_options
+    
+    elif engine == "easy":
+        # EasyOCR 支持
+        lang_codes = ["ch_sim"] if language == "zh" else (
+            language if isinstance(language, list) else [language]
+        )
+        ocr_options = EasyOcrOptions(lang=lang_codes)
+        ocr_options.force_full_page_ocr = True
+        pipeline_options.ocr_options = ocr_options
     
     elif engine == "tesseract":
-        # Tesseract Python API
-        pipeline_options.ocr_options = TesseractOcrOptions(lang=[language])
-    
-    elif engine == "tesseract_cli":
         # Tesseract CLI
-        pipeline_options.ocr_options = TesseractCliOcrOptions(lang=[language])
+        lang_codes = ["chi_sim"] if language == "zh" else (
+            language if isinstance(language, list) else [language]
+        )
+        ocr_options = TesseractCliOcrOptions(lang=lang_codes)
+        ocr_options.force_full_page_ocr = True
+        pipeline_options.ocr_options = ocr_options
     
     else:
-        # 默认使用标准OCR
-        logger.warning(f"未知OCR引擎 '{engine}'，使用默认引擎")
+        # 默认使用RapidOCR
+        logger.warning(f"未知OCR引擎 '{engine}'，使用RapidOCR")
+        ocr_options = RapidOcrOptions()
+        ocr_options.force_full_page_ocr = True
+        pipeline_options.ocr_options = ocr_options
     
     # 创建转换器
     return DocumentConverter(

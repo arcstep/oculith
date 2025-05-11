@@ -38,7 +38,14 @@ def export_markdown(
     
     # 处理每一行
     for _, row in df.iterrows():
-        page_content = row.get("contents_md", "")
+        # 检查contents_md是否存在，否则尝试使用contents
+        if "contents_md" in row and row["contents_md"]:
+            page_content = row["contents_md"]
+        elif "contents" in row and row["contents"]:
+            page_content = row["contents"]
+        else:
+            logger.warning("在parquet中未找到内容字段")
+            page_content = ""
         
         # 如果需要嵌入图像
         if markdown_type == "embedded" and "image.bytes" in row and row["image.bytes"]:
@@ -57,58 +64,56 @@ def export_markdown(
     # 合并所有页面内容
     full_markdown = "\n\n".join(markdown_content)
     
+    if not full_markdown.strip():
+        logger.warning(f"从 {parquet_path} 提取的内容为空")
+    
     return full_markdown
 
 
 def chunk_markdown(
-    parquet_path: str, 
+    parquet_path: str,
     max_chunk_size: int = 1000,
     overlap: int = 100,
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] = None,
+    **extra_config
 ) -> List[Dict[str, Any]]:
-    """
-    将parquet文件中的markdown内容切片
-    
-    参数:
-        parquet_path: parquet文件路径
-        max_chunk_size: 每个切片的最大token数
-        overlap: 切片重叠token数
-        metadata: 额外的元数据，将被传递给chunker
-    
-    返回:
-        切片列表
-    """
+    """将parquet文件中的markdown内容切片"""
     # 获取纯文本版本的Markdown
     markdown_content = export_markdown(parquet_path, markdown_type="reference")
     
+    # 如果内容为空，返回空列表
+    if not markdown_content.strip():
+        logger.warning("没有内容可切片")
+        return []
+        
     # 创建Markdown切片器
     chunker = get_chunker(
         doc_type="markdown", 
         max_chunk_size=max_chunk_size, 
-        overlap=overlap
+        overlap=overlap,
+        **extra_config
     )
     
-    # 由于chunker.chunk_document是异步方法，需要在同步环境中调用
+    # 设置基础元数据
+    base_metadata = {
+        "source": str(parquet_path),
+        "document_type": "markdown"
+    }
+    
+    # 合并用户提供的元数据
+    if metadata:
+        base_metadata.update(metadata)
+    
+    # 处理异步调用
     try:
-        # 设置基础元数据
-        base_metadata = {
-            "source": str(parquet_path),
-            "document_type": "markdown"
-        }
-        
-        # 合并用户提供的元数据
-        if metadata:
-            base_metadata.update(metadata)
-            
-        # 异步调用切片器
+        # 尝试在现有事件循环中运行
         loop = asyncio.get_event_loop()
         chunks = loop.run_until_complete(chunker.chunk_document(markdown_content, base_metadata))
-        
-        return chunks
     except RuntimeError:
         # 如果没有事件循环，创建一个新的
-        chunks = asyncio.run(chunker.chunk_document(markdown_content, metadata or {}))
-        return chunks
+        chunks = asyncio.run(chunker.chunk_document(markdown_content, base_metadata))
+    
+    return chunks
 
 
 def get_markdown_content(
