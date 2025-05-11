@@ -51,3 +51,38 @@ def convert_file(
 
     # 其他情况当作URL转换
     return converter.convert(content)
+
+def prepare_file(content: str, content_type: str = "auto", file_type: str = "") -> tuple[str, bool]:
+    """准备文件以供docling处理，返回(文件路径, 是否为临时文件)"""
+    if content_type == "file" or (content_type == "auto" and os.path.exists(content)):
+        # 返回绝对路径，但标记为非临时文件
+        return os.path.abspath(content), False
+
+    # URL处理 - 创建临时文件
+    if content_type == 'url' or (content_type == 'auto' and content.startswith(('http://', 'https://'))):
+        import tempfile
+        import requests
+        
+        # 下载文件到临时位置
+        suffix = f".{file_type}" if file_type else ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            response = requests.get(content, stream=True)
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=8192):
+                tmp.write(chunk)
+            return tmp.name, True
+    
+    # Base64处理 - 创建临时文件
+    if content_type == 'base64' or (content_type == 'auto' and is_base64(content)):
+        import tempfile
+        import base64
+        
+        # 解码并写入临时文件
+        suffix = f".{file_type}" if file_type else ""
+        decoded = base64.b64decode(content)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(decoded)
+            return tmp.name, True
+    
+    # 无法处理的情况
+    raise ValueError(f"无法处理的内容类型: {content_type}")
