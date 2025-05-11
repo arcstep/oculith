@@ -5,7 +5,8 @@ from oculith.convert import convert
 
 # 测试数据
 TEST_PDF_FILES = [
-    Path("tests/data/pdf/picture_classification.pdf")
+    Path("tests/data/pdf/picture_classification.pdf"),
+    Path("tests/data/pdf/beian.pdf"),
 ]
 
 OUTPUT_DIR = Path("tests/output/pdf_vlm")
@@ -40,7 +41,8 @@ def test_vlm_output_to_file():
     if not pdf_file.exists():
         pytest.skip(f"测试文件 {pdf_file} 不存在")
     
-    output_dir = OUTPUT_DIR / "vlm_output.md"
+    # 正确：使用不带后缀的目录名
+    output_dir = OUTPUT_DIR / "vlm_output"
     
     try:
         result = convert(
@@ -50,8 +52,10 @@ def test_vlm_output_to_file():
             output_dir=str(output_dir)
         )
         
-        assert output_dir.exists()
-        with open(output_dir, "r", encoding="utf-8") as f:
+        # 文件应该是 <output_dir>/<原文件名>.md
+        expected_file = output_dir / "picture_classification.md"
+        assert expected_file.exists()
+        with open(expected_file, "r", encoding="utf-8") as f:
             content = f.read()
             assert content.strip() != ""
     except Exception as e:

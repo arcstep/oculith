@@ -11,7 +11,7 @@ import io
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
-    PdfPipelineOptions, VlmPipelineOptions, ApiVlmOptions,
+    PdfPipelineOptions, VlmPipelineOptions, ApiVlmOptions, ResponseFormat,
     RapidOcrOptions, TesseractCliOcrOptions, OcrMacOptions, EasyOcrOptions
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
@@ -20,6 +20,7 @@ from docling.pipeline.vlm_pipeline import VlmPipeline
 from voidrail import create_app
 
 from .common import convert_file, prepare_file
+from .vlm_config import get_vlm_pipeline_options
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,12 @@ def convert(
                     # 默认简单转换器
                     converter = get_simple_converter()
             elif pipeline_type == "vlm":
-                converter = get_vlm_converter()
+                converter = get_vlm_converter(
+                    provider=os.environ.get("VLM_PROVIDER").lower(),
+                    model=os.environ.get("VLM_MODEL_NAME"),
+                    prompt=os.environ.get("VLM_PROMPT"),
+                    api_key=os.environ.get("VLM_API_KEY")
+                )
             else:
                 # 自动检测
                 ext = Path(temp_file_path).suffix.lower()[1:] if Path(temp_file_path).suffix else file_type
@@ -122,34 +128,48 @@ def convert(
             # 执行转换
             res = converter.convert(temp_file_path)
             
-            # 根据返回类型处理结果
+            # 初始化result变量，避免未定义错误
             if return_type == "dict_with_images":
-                # 提取插图和Markdown
-                result = extract_images_with_markdown(res, output_dir)
-                
-                return {
-                    "document_id": document_id,
-                    "markdown_content": result["markdown"],
-                    "images": result["images"]
-                }
+                # 处理多文件输出
+                if output_dir:
+                    output_dir_path = Path(output_dir)
+                    output_dir_path.mkdir(parents=True, exist_ok=True)
+                    result = extract_images_with_markdown(res, output_dir)
+                else:
+                    # 无输出路径时，只在内存中处理
+                    result = extract_images_with_markdown(res, None)
             else:
-                # 直接从document生成Markdown
+                # 处理单文件输出
                 markdown_type = ImageRefMode.EMBEDDED if return_type == "markdown_embedded" else ImageRefMode.REFERENCED
                 markdown_content = res.document.export_to_markdown(image_mode=markdown_type)
                 
-                # 如果提供了输出路径，保存到文件
-                if output_dir:
-                    output_dir = Path(output_dir)
-                    output_dir.parent.mkdir(parents=True, exist_ok=True)
-                    with open(output_dir, "w", encoding="utf-8") as f:
-                        f.write(markdown_content)
-                    logger.info(f"Markdown内容已保存至: {output_dir}")
-                
-                return {
+                # 构建基本结果
+                result = {
                     "document_id": document_id,
                     "markdown_content": markdown_content,
-                    "output_file": str(output_dir) if output_dir else None
+                    "output_file": None
                 }
+                
+                # 如果要输出到文件
+                if output_dir:
+                    output_path = Path(output_dir)
+                    # 判断是文件还是目录
+                    if output_path.suffix:  # 有后缀名，当作文件处理
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            f.write(markdown_content)
+                        result["output_file"] = str(output_path)
+                    else:  # 无后缀，当作目录处理
+                        output_path.mkdir(parents=True, exist_ok=True)
+                        doc_filename = Path(res.input.file).stem
+                        md_filename = output_path / f"{doc_filename}.md"
+                        with open(md_filename, "w", encoding="utf-8") as f:
+                            f.write(markdown_content)
+                        result["output_file"] = str(md_filename)
+                    
+                    logger.info(f"Markdown内容已保存至: {result['output_file']}")
+            
+            return result
         
         finally:
             # 只删除临时创建的文件
@@ -224,18 +244,20 @@ def get_simple_converter(input_format: Optional[InputFormat] = None) -> Document
     
     return DocumentConverter(allowed_formats=allowed_formats)
 
-def get_vlm_converter() -> DocumentConverter:
+def get_vlm_converter(
+    provider: str = None, 
+    model: str = None, 
+    prompt: str = None, 
+    api_key: str = None
+) -> DocumentConverter:
     """获取基于视觉语言模型的转换器"""
-    vlm_options = VlmPipelineOptions(
-        enable_remote_services=True
-    )
+    from .vlm_config import get_vlm_pipeline_options
     
-    # 使用Ollama作为默认VLM
-    vlm_options.vlm_options = ApiVlmOptions(
-        url="http://localhost:11434/v1/chat/completions",
-        params=dict(model="granite3.2-vision:2b"),
-        prompt="OCR the full page to markdown.",
-        timeout=90,
+    vlm_options = get_vlm_pipeline_options(
+        provider=provider,
+        model=model,
+        prompt=prompt,
+        api_key=api_key
     )
     
     return DocumentConverter(
@@ -254,7 +276,7 @@ def get_vlm_converter() -> DocumentConverter:
 def extract_images_with_markdown(conv_res, output_dir=None):
     """提取文档中的插图和Markdown内容"""
     result = {
-        "markdown": "",
+        "markdown_content": "",
         "images": {}
     }
     
@@ -271,7 +293,7 @@ def extract_images_with_markdown(conv_res, output_dir=None):
         
         # 读取生成的Markdown
         with open(md_filename, "r", encoding="utf-8") as f:
-            result["markdown"] = f.read()
+            result["markdown_content"] = f.read()
             
         # 提取并收集图片信息
         artifacts_dir = output_dir / f"{doc_filename}_artifacts"
@@ -282,8 +304,8 @@ def extract_images_with_markdown(conv_res, output_dir=None):
                     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
                     result["images"][img_path.name] = img_b64
     else:
-        # 直接使用export_to_markdown方法 - 这不需要文件路径
-        result["markdown"] = conv_res.document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+        # 直接使用export_to_markdown方法
+        result["markdown_content"] = conv_res.document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
             
         # 手动提取图片
         try:
@@ -302,7 +324,6 @@ def extract_images_with_markdown(conv_res, output_dir=None):
                     except Exception as e:
                         logger.warning(f"提取图片失败: {e}")
         except Exception as e:
-            # 某些格式可能没有iterate_items方法
             logger.debug(f"提取图片过程中遇到异常 (可能是不支持图像的格式): {e}")
     
     return result

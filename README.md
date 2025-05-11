@@ -20,187 +20,40 @@ Oculith 是一个强大的文档处理工具，可以将多种格式的文档（
 pip install oculith
 ```
 
-## 快速开始
+## 视觉语言模型配置
 
-### 作为服务启动
+本项目支持多种视觉语言模型用于文档处理。通过环境变量配置模型参数：
 
-最简单的方式是直接运行Oculith服务：
+### 环境变量
 
-```bash
-python -m oculith
-```
+| 变量名 | 描述 | 示例 |
+|--------|------|------|
+| VLM_PROVIDER | 模型提供商 | openai, ollama, gemini |
+| VLM_API_URL | API端点URL | https://api.openai.com/v1/chat/completions |
+| VLM_API_KEY | API密钥 | sk-your-api-key |
+| VLM_MODEL_NAME | 模型名称 | gpt-4-vision-preview |
+| VLM_PROMPT_TEMPLATE | 提示语模板 | OCR the full page to markdown |
+| VLM_TIMEOUT | 超时时间(秒) | 90 |
+| VLM_ADDITIONAL_PARAMS | 额外参数(JSON格式) | {"temperature": 0.2} |
 
-这将在默认端口(31573)启动服务。你可以通过以下选项自定义：
-
-```bash
-# 指定端口
-python -m oculith --port 8080
-
-# 指定允许的文档格式
-python -m oculith --allowed-formats pdf,docx,html
-
-# 指定输出目录
-python -m oculith --output-dir ./文档输出
-```
-
-### API使用方法
-
-服务启动后，你可以通过以下API进行文档处理：
-
-#### 1. 上传并处理文档
-
-```
-POST /oculith/files/upload
-```
-
-使用表单提交：
-- `file`: 要上传的文件
-- `title`: 可选的文档标题
-- `description`: 可选的文档描述
-- `tags`: 可选的标签列表
-- `auto_process`: 是否自动处理(true/false)
-
-#### 2. 收藏远程URL文件
-
-```
-POST /oculith/files/bookmark-remote
-```
-
-提交参数：
-- `url`: 远程文件的URL地址
-- `filename`: 可选的文件名
-- `title`: 可选的文档标题
-- `description`: 可选的文档描述
-- `tags`: 可选的标签列表
-- `auto_process`: 是否自动处理(true/false)
-
-#### 3. 手动启动文件处理
-
-```
-POST /oculith/files/{file_id}/process
-```
-
-提交参数：
-- `step`: 处理步骤(convert/chunk/index/all)
-- `priority`: 任务优先级(数字)
-
-#### 4. 获取支持的格式
-
-```
-GET /oculith/formats
-```
-
-#### 5. 获取文件列表
-
-```
-GET /oculith/files
-```
-
-## 文件管理功能
-
-Oculith 提供了完整的文件管理功能：
-
-- 获取文件列表：`GET /oculith/files`
-- 获取文件信息：`GET /oculith/files/{file_id}`
-- 获取Markdown内容：`GET /oculith/files/{file_id}/markdown`
-- 更新文件元数据：`PATCH /oculith/files/{file_id}`
-- 删除文件：`DELETE /oculith/files/{file_id}`
-- 下载文件：`GET /oculith/files/{file_id}/download`
-- 监控处理状态：`GET /oculith/files/{file_id}/process/stream` (SSE流)
-- 获取存储状态：`GET /oculith/files/storage/status`
-
-## 任务管理
-
-Oculith 支持异步任务管理：
-
-- 获取任务状态：`GET /oculith/tasks/{task_id}`
-- 取消任务：`POST /oculith/tasks/{task_id}/cancel`
-- 队列诊断：`GET /oculith/queue/diagnostics`
-
-## 搜索功能
-
-Oculith 支持基于向量相似度的语义检索：
-
-- 检索内容片段：`POST /oculith/search/chunks`
-- 检索相似文档：`POST /oculith/search/documents`
-
-## 使用示例
-
-### 使用curl上传并处理文档
+### 示例用法
 
 ```bash
-curl -X POST "http://localhost:31573/oculith/files/upload" \
-  -F "file=@/路径/文档.pdf" \
-  -F "title=测试文档" \
-  -F "description=这是一个测试文档" \
-  -F "auto_process=true"
+# OpenAI
+export VLM_PROVIDER=openai
+export VLM_API_KEY=sk-your-key
+python -m your_application
+
+# Ollama本地模型
+export VLM_PROVIDER=ollama
+export VLM_MODEL_NAME=llava:latest
+python -m your_application
+
+# Google Gemini
+export VLM_PROVIDER=gemini
+export VLM_API_KEY=your-gemini-key
+python -m your_application
+```
 ```
 
-### 收藏远程URL
-
-```bash
-curl -X POST "http://localhost:31573/oculith/files/bookmark-remote" \
-  -F "url=https://example.com/document.pdf" \
-  -F "title=远程文档" \
-  -F "auto_process=true"
-```
-
-### 监控处理状态（前端代码）
-
-```javascript
-// 使用EventSource监听处理状态
-const eventSource = new EventSource(
-  'http://localhost:31573/oculith/files/FILE_ID/process/stream',
-  { headers: { 'Authorization': 'Bearer 你的令牌' } }
-);
-
-eventSource.addEventListener('status', (event) => {
-  const data = JSON.parse(event.data);
-  console.log(`处理状态: ${data.status}`);
-});
-
-eventSource.addEventListener('complete', (event) => {
-  console.log('处理完成');
-  eventSource.close();
-});
-```
-
-### 检索相似内容
-
-```bash
-curl -X POST "http://localhost:31573/oculith/search/chunks" \
-  -F "query=关键词搜索" \
-  -F "threshold=0.7" \
-  -F "limit=5"
-```
-
-## 集成到其他应用
-
-Oculith可以轻松集成到现有的FastAPI应用中：
-
-```python
-from fastapi import FastAPI
-from oculith.api.endpoints import mount_docling_service
-
-app = FastAPI()
-
-# 挂载Oculith服务
-mount_docling_service(
-    app=app,
-    output_dir="./data/oculith",
-    allowed_formats=["pdf", "docx", "html", "md"],
-    prefix="/api"  # API端点前缀
-)
-```
-
-## 注意事项
-
-- 第一次使用时需要设置环境变量 `FASTAPI_SECRET_KEY` 作为认证密钥
-- 对于大文件处理，可能需要更长的处理时间
-- 默认情况下，每个用户的存储限制为200MB
-- 任务队列默认最大并发数为3，可根据服务器资源调整
-- 服务重启后任务队列会重置，请妥善管理任务状态
-
-## 更多帮助
-
-启动服务后，你可以访问 `http://localhost:31573/docs` 获取完整的API文档。
+这种分离的方式使代码更加整洁，职责更加明确，也便于后续扩展新的模型提供商。
