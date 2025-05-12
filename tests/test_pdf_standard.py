@@ -25,7 +25,7 @@ def test_pdf_without_ocr(pdf_file):
     result = convert(
         content=str(pdf_file),
         content_type="file",
-        pipeline_type="standard",
+        pipeline="standard",
         ocr=None  # 明确指定不使用OCR
     )
     
@@ -45,7 +45,7 @@ def test_pdf_with_images():
     result = convert(
         content=str(pdf_file),
         content_type="file",
-        pipeline_type="standard",
+        pipeline="standard",
         generate_images="picture",  # 提取图片
         return_type="dict_with_images",
         output_dir=str(output_dir)
@@ -68,7 +68,7 @@ def test_pdf_image_scaling(image_scale):
     result = convert(
         content=str(pdf_file),
         content_type="file",
-        pipeline_type="standard",
+        pipeline="standard",
         generate_images="picture",
         images_scale=image_scale,
         return_type="dict_with_images"

@@ -26,7 +26,7 @@ def test_basic_conversion(format_type):
         content=str(test_file),
         content_type="file",
         file_type=format_type,
-        pipeline_type="simple"
+        pipeline="simple"
     )
     
     # 基本检查

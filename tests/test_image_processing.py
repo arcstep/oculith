@@ -23,7 +23,7 @@ def test_image_basic_conversion(image_file):
     result = convert(
         content=str(image_file),
         content_type="file",
-        pipeline_type="standard"  # 应该自动转为PDF进行处理
+        pipeline="standard"  # 应该自动转为PDF进行处理
     )
     
     assert "error" not in result, f"转换错误: {result.get('message', '')}"
@@ -41,13 +41,17 @@ def test_image_with_ocr(ocr_engine):
         result = convert(
             content=str(image_file),
             content_type="file",
-            pipeline_type="standard",
+            pipeline="standard",
             ocr=ocr_engine
         )
         
         assert "error" not in result, f"转换错误: {result.get('message', '')}"
         assert "markdown_content" in result
         assert result["markdown_content"].strip() != ""
+        
+        # 验证OCR是否正确提取了文档中的关键文本
+        expected_text = "互联网信息服务深度合成管理规定"
+        assert expected_text in result["markdown_content"], f"OCR未能正确识别文档内容，缺少关键文本: {expected_text}"
     except Exception as e:
         pytest.skip(f"图片OCR测试失败: {e}")
 
@@ -62,7 +66,7 @@ def test_image_with_vlm():
         result = convert(
             content=str(image_file),
             content_type="file",
-            pipeline_type="vlm"
+            pipeline="vlm"
         )
         
         assert "error" not in result, f"转换错误: {result.get('message', '')}"
@@ -82,10 +86,14 @@ def test_image_dict_with_images():
     result = convert(
         content=str(image_file),
         content_type="file",
-        pipeline_type="standard",
+        pipeline="standard",
         return_type="dict_with_images",
         output_dir=str(output_dir)
     )
     
     assert "markdown_content" in result
     assert "images" in result
+    
+    # 验证OCR是否正确提取了文档中的关键文本
+    expected_text = "互联网信息服务深度合成管理规定"
+    assert expected_text in result["markdown_content"], f"OCR未能正确识别文档内容，缺少关键文本: {expected_text}"

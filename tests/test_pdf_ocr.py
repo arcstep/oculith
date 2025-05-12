@@ -27,7 +27,7 @@ def test_pdf_ocr_basic(pdf_file, ocr_engine):
         result = convert(
             content=str(pdf_file),
             content_type="file",
-            pipeline_type="standard",
+            pipeline="standard",
             ocr=ocr_engine
         )
         
@@ -51,7 +51,7 @@ def test_ocr_output_formats(return_type):
     result = convert(
         content=str(pdf_file),
         content_type="file",
-        pipeline_type="standard",
+        pipeline="standard",
         ocr=ocr_engine,
         return_type=return_type,
         generate_images="picture" if return_type in ["markdown_embedded", "dict_with_images"] else "none"

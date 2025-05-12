@@ -9,6 +9,7 @@ import base64
 from docling_core.types.doc import ImageRefMode, PictureItem
 import io
 import time
+from pypdf import PdfReader
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -37,7 +38,7 @@ def convert(
     pipeline: Literal["standard", "simple", "vlm"] = "auto",
     ocr: Optional[str] = None,
     language: str = "zh",
-    return_type: Literal["markdown", "markdown_embedded", "dict_with_images"] = "dict_with_images",
+    return_type: Literal["markdown", "markdown_embedded", "dict_with_images"] = "markdown",
     images_scale: float = 2.0,
     generate_images: Literal["none", "page", "picture", "all"] = "picture",
     advanced_features: Optional[Dict[str, bool]] = None,
@@ -79,8 +80,12 @@ def convert(
         is_temp_file = False
         
         try:
-            temp_file_path, is_temp_file = prepare_file(content, content_type, file_type)
-            logger.info(f"文件准备完成: {temp_file_path}")
+            temp_file_path, is_temp_file, detected_type, is_converted_from_image = prepare_file(content, content_type, file_type)
+            logger.info(f"文件准备完成: {temp_file_path}, 检测到文件类型: {detected_type}, 是否图片转PDF: {is_converted_from_image}")
+            
+            # 如果未指定文件类型，使用检测到的类型
+            if not file_type and detected_type:
+                file_type = detected_type
             
             # 根据管道类型配置选项
             if pipeline in ["standard", "auto"]:
@@ -108,6 +113,12 @@ def convert(
                         if hasattr(pipeline_options, feature):
                             setattr(pipeline_options, feature, enabled)
                             
+                # 对于图片转换的PDF，如果没有指定OCR引擎，自动使用rapid
+                if not ocr and is_converted_from_image:
+                    logger.info(f"检测到图片转换的PDF，未指定OCR引擎，自动使用rapid引擎")
+                    ocr = "rapid"
+                    model_info["ocr_engine"] = ocr
+                
                 # 直接使用配置好的选项创建新的转换器
                 logger.info(f"创建PDF转换器，OCR引擎: {ocr}, 语言: {language}")
                 converter = get_pdf_converter(
@@ -119,16 +130,25 @@ def convert(
                 model_info["pipeline"] = "standard"
                 
             elif pipeline == "simple":
-                if file_type:
-                    # 根据文件扩展名获取格式
-                    logger.info(f"创建Simple转换器，文件类型: {file_type}")
-                    converter = get_simple_converter(file_type)
-                else:
-                    # 默认简单转换器
-                    logger.info("创建默认Simple转换器")
-                    converter = get_simple_converter()
-                model_info["pipeline"] = "simple"
+                ext = Path(temp_file_path).suffix.lower()[1:] if Path(temp_file_path).suffix else file_type
                 
+                if ext == "pdf":
+                    logger.info("检测到PDF文件，使用PyPDF2快速转换")
+                    # 使用PyPDF2快速转换
+                    res = get_fast_pdf_converter(temp_file_path)
+                    model_info["pipeline"] = "simple_pdf"
+                else:
+                    # 原有的simple转换逻辑
+                    if file_type:
+                        logger.info(f"创建Simple转换器，文件类型: {file_type}")
+                        converter = get_simple_converter(file_type)
+                    else:
+                        logger.info("创建默认Simple转换器")
+                        converter = get_simple_converter()
+                    
+                    model_info["pipeline"] = "simple"
+                    res = converter.convert(temp_file_path)
+            
             elif pipeline == "vlm":
                 logger.info("创建VLM转换器")
                 # 获取环境变量中的提供商和模型信息
@@ -151,8 +171,14 @@ def convert(
             else:
                 # 自动检测
                 ext = Path(temp_file_path).suffix.lower()[1:] if Path(temp_file_path).suffix else file_type
-                if ext in ["pdf", "jpg", "jpeg", "png", "gif", "bmp", "tiff"]:
-                    logger.info(f"自动检测为图像/PDF文件，创建PDF转换器")
+                if ext == "pdf" or is_converted_from_image:  # 使用标志而不是列举扩展名
+                    logger.info(f"自动检测为PDF文件，创建PDF转换器")
+                    # 对于图片转换的PDF，如果没有指定OCR引擎，自动使用rapid
+                    if not ocr and is_converted_from_image:
+                        logger.info(f"检测到图片转换的PDF，未指定OCR引擎，自动使用rapid引擎")
+                        ocr = "rapid"
+                        model_info["ocr_engine"] = ocr
+                        
                     converter = get_pdf_converter(ocr=ocr, language=language)
                     model_info["pipeline"] = "standard"
                     model_info["ocr_engine"] = ocr or "默认"
@@ -168,49 +194,94 @@ def convert(
             conversion_time = time.time() - start_time
             logger.info(f"文档转换完成，耗时: {conversion_time:.2f}秒")
             
-            # 初始化result变量，避免未定义错误
-            if return_type == "dict_with_images":
-                # 处理多文件输出
-                if output_dir:
-                    output_dir_path = Path(output_dir)
-                    output_dir_path.mkdir(parents=True, exist_ok=True)
-                    logger.info(f"提取图像和Markdown到目录: {output_dir}")
-                    result = extract_images_with_markdown(res, output_dir)
+            # 如果是PyPDF2快速转换的结果
+            if hasattr(res, 'text') and model_info["pipeline"] == "simple_pdf":
+                if return_type == "dict_with_images":
+                    result = {
+                        "document_id": document_id,
+                        "markdown_content": res.text,
+                        "images": {},  # 空图片字典
+                        "output_file": None
+                    }
+                    
+                    # 如果需要输出到文件
+                    if output_dir:
+                        output_path = Path(output_dir)
+                        output_path.mkdir(parents=True, exist_ok=True)
+                        doc_filename = Path(res.input.file).stem
+                        md_filename = output_path / f"{doc_filename}.md"
+                        logger.info(f"保存快速提取的文本到文件: {md_filename}")
+                        with open(md_filename, "w", encoding="utf-8") as f:
+                            f.write(res.text)
+                        result["output_file"] = str(md_filename)
                 else:
-                    # 无输出路径时，只在内存中处理
-                    logger.info("提取图像和Markdown到内存")
-                    result = extract_images_with_markdown(res, None)
+                    # markdown或markdown_embedded模式
+                    result = {
+                        "document_id": document_id,
+                        "markdown_content": res.text,
+                        "output_file": None
+                    }
+                    
+                    # 如果需要输出到文件
+                    if output_dir:
+                        output_path = Path(output_dir)
+                        output_path.mkdir(parents=True, exist_ok=True)
+                        doc_filename = Path(res.input.file).stem
+                        md_filename = output_path / f"{doc_filename}.md"
+                        logger.info(f"保存快速提取的文本到文件: {md_filename}")
+                        with open(md_filename, "w", encoding="utf-8") as f:
+                            f.write(res.text)
+                        result["output_file"] = str(md_filename)
             else:
                 # 处理单文件输出
-                markdown_type = ImageRefMode.EMBEDDED if return_type == "markdown_embedded" else ImageRefMode.REFERENCED
-                logger.info(f"导出Markdown，类型: {return_type}")
-                markdown_content = res.document.export_to_markdown(image_mode=markdown_type)
-                
-                # 构建基本结果
-                result = {
-                    "document_id": document_id,
-                    "markdown_content": markdown_content,
-                    "output_file": None
-                }
-                
-                # 如果要输出到文件
-                if output_dir:
-                    output_path = Path(output_dir)
-                    # 判断是文件还是目录
-                    if output_path.suffix:  # 有后缀名，当作文件处理
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        logger.info(f"保存Markdown到文件: {output_path}")
-                        with open(output_path, "w", encoding="utf-8") as f:
-                            f.write(markdown_content)
-                        result["output_file"] = str(output_path)
-                    else:  # 无后缀，当作目录处理
+                if return_type == "dict_with_images":
+                    logger.info(f"导出Markdown，类型: {return_type}")
+                    # 使用extract_images_with_markdown功能提取图像和内容
+                    result = extract_images_with_markdown(res, output_dir)
+                    # 添加document_id
+                    result["document_id"] = document_id
+                    
+                    # 如果指定了输出目录，保存结果
+                    if output_dir:
+                        output_path = Path(output_dir)
                         output_path.mkdir(parents=True, exist_ok=True)
                         doc_filename = Path(res.input.file).stem
                         md_filename = output_path / f"{doc_filename}.md"
                         logger.info(f"保存Markdown到文件: {md_filename}")
                         with open(md_filename, "w", encoding="utf-8") as f:
-                            f.write(markdown_content)
+                            f.write(result["markdown_content"])
                         result["output_file"] = str(md_filename)
+                else:
+                    # 处理markdown和markdown_embedded模式
+                    markdown_type = ImageRefMode.EMBEDDED if return_type == "markdown_embedded" else ImageRefMode.REFERENCED
+                    logger.info(f"导出Markdown，类型: {return_type}")
+                    markdown_content = res.document.export_to_markdown(image_mode=markdown_type)
+                    
+                    # 构建基本结果
+                    result = {
+                        "document_id": document_id,
+                        "markdown_content": markdown_content,
+                        "output_file": None
+                    }
+                    
+                    # 如果要输出到文件
+                    if output_dir:
+                        output_path = Path(output_dir)
+                        # 判断是文件还是目录
+                        if output_path.suffix:  # 有后缀名，当作文件处理
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            logger.info(f"保存Markdown到文件: {output_path}")
+                            with open(output_path, "w", encoding="utf-8") as f:
+                                f.write(markdown_content)
+                            result["output_file"] = str(output_path)
+                        else:  # 无后缀，当作目录处理
+                            output_path.mkdir(parents=True, exist_ok=True)
+                            doc_filename = Path(res.input.file).stem
+                            md_filename = output_path / f"{doc_filename}.md"
+                            logger.info(f"保存Markdown到文件: {md_filename}")
+                            with open(md_filename, "w", encoding="utf-8") as f:
+                                f.write(markdown_content)
+                            result["output_file"] = str(md_filename)
             
             # 添加模型信息到结果中
             result["model_info"] = model_info
@@ -386,3 +457,38 @@ def extract_images_with_markdown(conv_res, output_dir=None):
             logger.debug(f"提取图片过程中遇到异常 (可能是不支持图像的格式): {e}")
     
     return result
+
+def extract_with_pypdf2(pdf_path):
+    """使用PyPDF2快速提取PDF文本"""
+    start_time = time.time()
+    reader = PdfReader(pdf_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() + "\n\n"
+    end_time = time.time()
+    return text, end_time - start_time
+
+def get_fast_pdf_converter(input_file):
+    """获取基于PyPDF2的快速PDF转换器"""
+    try:
+        text, conversion_time = extract_with_pypdf2(input_file)
+        logger.info(f"PyPDF2提取完成，耗时: {conversion_time:.2f}秒")
+        
+        # 创建一个类似于Docling转换结果的简单对象
+        class SimpleConversionResult:
+            def __init__(self, text, input_file):
+                self.text = text
+                self.input = type('obj', (object,), {'file': input_file})
+                self.document = self
+
+            def export_to_markdown(self, image_mode=None):
+                return self.text
+                
+            def save_as_markdown(self, path, image_mode=None):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.text)
+        
+        return SimpleConversionResult(text, input_file)
+    except Exception as e:
+        logger.exception(f"PyPDF2快速提取失败: {str(e)}")
+        raise

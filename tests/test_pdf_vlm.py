@@ -25,7 +25,7 @@ def test_pdf_vlm_basic(pdf_file):
         result = convert(
             content=str(pdf_file),
             content_type="file",
-            pipeline_type="vlm"  # 使用VLM Pipeline
+            pipeline="vlm"  # 使用VLM Pipeline
         )
         
         assert "error" not in result, f"转换错误: {result.get('message', '')}"
@@ -48,7 +48,7 @@ def test_vlm_output_to_file():
         result = convert(
             content=str(pdf_file),
             content_type="file",
-            pipeline_type="vlm",
+            pipeline="vlm",
             output_dir=str(output_dir)
         )
         
