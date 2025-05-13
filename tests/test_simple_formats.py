@@ -67,33 +67,35 @@ def test_different_content_types():
         assert "markdown_content" in result_b64
 
 def test_output_formats():
-    """测试不同输出格式"""
+    """测试不同图片返回选项"""
     test_file = TEST_FILES["md"]
     
-    # 测试Markdown输出
-    result_md = convert(
+    # 测试默认不返回base64图片
+    result_no_base64 = convert(
         content=str(test_file),
-        content_type="file",
-        return_type="markdown"
+        content_type="file"
     )
-    assert "markdown_content" in result_md
+    assert "markdown_content" in result_no_base64
+    assert "images" in result_no_base64
     
-    # 测试嵌入式Markdown输出
-    result_embedded = convert(
+    # 测试返回base64图片
+    result_with_base64 = convert(
         content=str(test_file),
         content_type="file",
-        return_type="markdown_embedded"
+        return_base64_images=True
     )
-    assert "markdown_content" in result_embedded
+    assert "markdown_content" in result_with_base64
+    assert "images" in result_with_base64
     
-    # 测试带图像的字典输出
-    result_dict = convert(
-        content=str(test_file),
-        content_type="file",
-        return_type="dict_with_images"
-    )
-    assert "markdown_content" in result_dict
-    assert "images" in result_dict
+    # 检查图片信息结构
+    if result_with_base64["images"]:
+        for img_id, img_info in result_with_base64["images"].items():
+            assert "filename" in img_info
+            assert "ref_path" in img_info
+            assert isinstance(img_info["filename"], str)
+            assert isinstance(img_info["ref_path"], str)
+            if "base64" in img_info:
+                assert img_info["base64"].startswith("iVBOR") or img_info["base64"].startswith("/9j/")
 
 def test_output_to_file():
     """测试输出到文件"""

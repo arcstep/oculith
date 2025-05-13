@@ -37,8 +37,8 @@ def test_pdf_ocr_basic(pdf_file, ocr_engine):
     except Exception as e:
         pytest.skip(f"OCR引擎 {ocr_engine} 测试失败: {e}")
 
-@pytest.mark.parametrize("return_type", ["markdown", "markdown_embedded", "dict_with_images"])
-def test_ocr_output_formats(return_type):
+@pytest.mark.parametrize("return_base64_images", [False, True])
+def test_ocr_output_formats(return_base64_images):
     """测试OCR处理的不同输出格式"""
     # 选择一个适合OCR的PDF
     pdf_file = Path("tests/data/pdf/picture_classification.pdf")
@@ -53,12 +53,15 @@ def test_ocr_output_formats(return_type):
         content_type="file",
         pipeline="standard",
         ocr=ocr_engine,
-        return_type=return_type,
-        generate_images="picture" if return_type in ["markdown_embedded", "dict_with_images"] else "none"
+        return_base64_images=return_base64_images,
+        generate_images="picture"
     )
     
     assert "error" not in result, f"转换错误: {result.get('message', '')}"
     assert "markdown_content" in result
+    assert "images" in result
     
-    if return_type == "dict_with_images":
-        assert "images" in result
+    # 检查图片数据是否按预期存在
+    if return_base64_images and result["images"]:
+        for img_info in result["images"].values():
+            assert "base64" in img_info

@@ -75,7 +75,7 @@ def test_image_with_vlm():
         pytest.skip(f"图片VLM测试失败: {e}")
 
 def test_image_dict_with_images():
-    """测试图片生成dict_with_images格式"""
+    """测试图片生成包含图片信息的结果"""
     # 选择一个图片
     image_file = Path("tests/data/images/beian.png")
     if not image_file.exists():
@@ -87,7 +87,7 @@ def test_image_dict_with_images():
         content=str(image_file),
         content_type="file",
         pipeline="standard",
-        return_type="dict_with_images",
+        return_base64_images=True,  # 新参数，替代 return_type="dict_with_images"
         output_dir=str(output_dir)
     )
     

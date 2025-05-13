@@ -14,7 +14,8 @@ from pypdf import PdfReader
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions, VlmPipelineOptions, ApiVlmOptions, ResponseFormat,
-    RapidOcrOptions, TesseractCliOcrOptions, OcrMacOptions, EasyOcrOptions
+    RapidOcrOptions, TesseractCliOcrOptions, OcrMacOptions, EasyOcrOptions,
+    PictureDescriptionApiOptions
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.pipeline.vlm_pipeline import VlmPipeline
@@ -38,11 +39,15 @@ def convert(
     pipeline: Literal["standard", "simple", "vlm"] = "auto",
     ocr: Optional[str] = None,
     language: str = "zh",
-    return_type: Literal["markdown", "markdown_embedded", "dict_with_images"] = "markdown",
+    return_base64_images: bool = False,
     images_scale: float = 2.0,
     generate_images: Literal["none", "page", "picture", "all"] = "picture",
     advanced_features: Optional[Dict[str, bool]] = None,
     output_dir: Optional[str] = None,
+    enable_vlm_picture_description: bool = False,
+    vlm_provider: Optional[str] = None,
+    vlm_model: Optional[str] = None,
+    vlm_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """统一的文档转换入口
     
@@ -54,17 +59,22 @@ def convert(
         pipeline: 处理管道类型 (auto自动检测，standard适用于PDF/图片，simple适用于其他格式，vlm使用视觉语言模型)
         ocr: OCR引擎名称，None表示根据文件类型自动决定
         language: 语言代码
-        return_type: 返回类型
+        return_base64_images: 是否返回图片的base64编码数据
         images_scale: 图像缩放比例
         generate_images: 图像生成控制
         advanced_features: 高级特性控制
         output_dir: 输出文件路径
+        enable_vlm_picture_description: 是否启用VLM图片描述功能
+        vlm_provider: VLM提供商(dashscope, ollama, openai, huggingface)
+        vlm_model: VLM模型名称
+        vlm_prompt: VLM提示词
     """
     model_info = {
         "pipeline": pipeline,
         "provider": None,
         "model": None,
         "ocr_engine": ocr,
+        "vlm_enabled": enable_vlm_picture_description,
     }
     
     try:
@@ -73,7 +83,7 @@ def convert(
             content_hash = hashlib.md5(content.encode() if isinstance(content, str) else content).hexdigest()
             document_id = f"{content_hash}"
         
-        logger.info(f"开始处理文档 ID: {document_id}, 管道类型: {pipeline}, OCR引擎: {ocr}")
+        logger.info(f"开始处理文档 ID: {document_id}, 管道类型: {pipeline}, OCR引擎: {ocr}, VLM图片描述: {enable_vlm_picture_description}")
         
         # 使用convert_file预处理 - 这将准备文件并识别格式
         temp_file_path = None
@@ -112,6 +122,37 @@ def convert(
                     for feature, enabled in advanced_features.items():
                         if hasattr(pipeline_options, feature):
                             setattr(pipeline_options, feature, enabled)
+                
+                # 如果启用VLM图片描述功能
+                if enable_vlm_picture_description:
+                    # 启用远程服务和图片描述
+                    pipeline_options.enable_remote_services = True
+                    pipeline_options.do_picture_description = True
+                    
+                    # 从vlm_config获取图片描述API选项
+                    from .vlm_config import get_picture_description_api_options
+                    
+                    # 获取配置选项并应用
+                    api_options = get_picture_description_api_options(
+                        provider=vlm_provider,
+                        model=vlm_model,
+                        prompt=vlm_prompt
+                    )
+                    
+                    # 使用正确的选项
+                    pipeline_options.picture_description_options = api_options
+                    
+                    # 更新模型信息
+                    vlm_provider = vlm_provider or os.environ.get("VLM_PROVIDER", "ollama")
+                    vlm_model = vlm_model or os.environ.get("VLM_MODEL_NAME", "")
+                    
+                    # 如果模型名为空，获取默认值
+                    if not vlm_model:
+                        vlm_model = get_default_vlm_model(vlm_provider)
+                    
+                    model_info["vlm_provider"] = vlm_provider
+                    model_info["vlm_model"] = vlm_model
+                    logger.info(f"启用VLM图片描述，提供商: {model_info['vlm_provider']}, 模型: {model_info['vlm_model']}")
                             
                 # 对于图片转换的PDF，如果没有指定OCR引擎，自动使用rapid
                 if not ocr and is_converted_from_image:
@@ -155,7 +196,11 @@ def convert(
                 provider = os.environ.get("VLM_PROVIDER", "ollama")
                 model = os.environ.get("VLM_MODEL_NAME", "")
                 
-                logger.info(f"使用VLM服务，提供商: {provider}, 模型: {model or '默认'}")
+                # 更新：如果model为空，获取默认值
+                if not model:
+                    model = get_default_vlm_model(provider)
+                
+                logger.info(f"使用VLM服务，提供商: {provider}, 模型: {model}")
                 
                 converter = get_vlm_converter(
                     provider=provider,
@@ -166,7 +211,7 @@ def convert(
                 
                 model_info["pipeline"] = "vlm"
                 model_info["provider"] = provider
-                model_info["model"] = model or "默认模型"
+                model_info["model"] = model
                 
             else:
                 # 自动检测
@@ -194,97 +239,123 @@ def convert(
             conversion_time = time.time() - start_time
             logger.info(f"文档转换完成，耗时: {conversion_time:.2f}秒")
             
+            # 处理结果
+            result = {
+                "document_id": document_id,
+                "markdown_content": "",
+                "images": {},
+                "output_file": None,
+                "model_info": model_info
+            }
+            
             # 如果是PyPDF2快速转换的结果
             if hasattr(res, 'text') and model_info["pipeline"] == "simple_pdf":
-                if return_type == "dict_with_images":
-                    result = {
-                        "document_id": document_id,
-                        "markdown_content": res.text,
-                        "images": {},  # 空图片字典
-                        "output_file": None
-                    }
-                    
-                    # 如果需要输出到文件
-                    if output_dir:
-                        output_path = Path(output_dir)
-                        output_path.mkdir(parents=True, exist_ok=True)
-                        doc_filename = Path(res.input.file).stem
-                        md_filename = output_path / f"{doc_filename}.md"
-                        logger.info(f"保存快速提取的文本到文件: {md_filename}")
-                        with open(md_filename, "w", encoding="utf-8") as f:
-                            f.write(res.text)
-                        result["output_file"] = str(md_filename)
-                else:
-                    # markdown或markdown_embedded模式
-                    result = {
-                        "document_id": document_id,
-                        "markdown_content": res.text,
-                        "output_file": None
-                    }
-                    
-                    # 如果需要输出到文件
-                    if output_dir:
-                        output_path = Path(output_dir)
-                        output_path.mkdir(parents=True, exist_ok=True)
-                        doc_filename = Path(res.input.file).stem
-                        md_filename = output_path / f"{doc_filename}.md"
-                        logger.info(f"保存快速提取的文本到文件: {md_filename}")
-                        with open(md_filename, "w", encoding="utf-8") as f:
-                            f.write(res.text)
-                        result["output_file"] = str(md_filename)
+                result["markdown_content"] = res.text
+                
+                # 如果需要输出到文件
+                if output_dir:
+                    output_path = Path(output_dir)
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    doc_filename = Path(res.input.file).stem
+                    md_filename = output_path / f"{doc_filename}.md"
+                    logger.info(f"保存快速提取的文本到文件: {md_filename}")
+                    with open(md_filename, "w", encoding="utf-8") as f:
+                        f.write(res.text)
+                    result["output_file"] = str(md_filename)
             else:
-                # 处理单文件输出
-                if return_type == "dict_with_images":
-                    logger.info(f"导出Markdown，类型: {return_type}")
-                    # 使用extract_images_with_markdown功能提取图像和内容
-                    result = extract_images_with_markdown(res, output_dir)
-                    # 添加document_id
-                    result["document_id"] = document_id
-                    
-                    # 如果指定了输出目录，保存结果
-                    if output_dir:
-                        output_path = Path(output_dir)
+                # 标准或VLM处理结果
+                markdown_content = res.document.export_to_markdown(image_mode=ImageRefMode.REFERENCED)
+                result["markdown_content"] = markdown_content
+                
+                # 检查并处理图片信息
+                pic_count = 0
+                doc_filename = Path(res.input.file).stem
+
+                for element, _level in res.document.iterate_items():
+                    if isinstance(element, PictureItem):
+                        pic_count += 1
+                        ref_id = element.self_ref
+                        caption = element.caption_text(doc=res.document)
+                        has_annotations = hasattr(element, "annotations") and element.annotations
+                        
+                        # 记录日志
+                        logger.info(f"图片 {ref_id} - 标题: {caption}")
+                        if has_annotations:
+                            logger.info(f"图片注释: {element.annotations}")
+                        else:
+                            logger.info(f"图片没有注释")
+                        
+                        # 无论是否需要base64数据，都添加到返回结果中
+                        image_info = {
+                            "filename": f"{ref_id}.png",
+                            "ref_path": f"{doc_filename}_artifacts/{ref_id}.png",
+                            "caption": caption
+                        }
+                        
+                        # 如果有图片注释，则返回
+                        if has_annotations:
+                            # 将PictureDescriptionData对象转换为可序列化的字典
+                            if hasattr(element.annotations, '__dict__'):
+                                # 如果是对象类型，转换为字典
+                                annotations_dict = {}
+                                for key, value in element.annotations.__dict__.items():
+                                    if key.startswith('_'):  # 跳过私有属性
+                                        continue
+                                    if hasattr(value, '__dict__'):
+                                        annotations_dict[key] = str(value)  # 复杂对象转为字符串
+                                    else:
+                                        annotations_dict[key] = value
+                                image_info["annotations"] = annotations_dict
+                            else:
+                                # 如果是其他类型，转为字符串
+                                image_info["annotations"] = str(element.annotations)
+                        
+                        # 只有在需要时才提取并返回base64数据
+                        if return_base64_images:
+                            try:
+                                image = element.get_image(res.document)
+                                with io.BytesIO() as buffer:
+                                    image.save(buffer, format="PNG")
+                                    img_bytes = buffer.getvalue()
+                                    image_info["base64"] = base64.b64encode(img_bytes).decode("utf-8")
+                            except Exception as e:
+                                logger.warning(f"提取图片失败: {e}")
+                        
+                        # 添加到结果中（无论是否有base64数据）
+                        result["images"][ref_id] = image_info
+                
+                logger.info(f"文档中共包含 {pic_count} 个图片项目")
+                
+                # 如果要输出到文件
+                if output_dir:
+                    output_path = Path(output_dir)
+                    # 判断是文件还是目录
+                    if output_path.suffix:  # 有后缀名，当作文件处理
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        logger.info(f"保存Markdown到文件: {output_path}")
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            f.write(markdown_content)
+                        result["output_file"] = str(output_path)
+                    else:  # 无后缀，当作目录处理
                         output_path.mkdir(parents=True, exist_ok=True)
                         doc_filename = Path(res.input.file).stem
                         md_filename = output_path / f"{doc_filename}.md"
                         logger.info(f"保存Markdown到文件: {md_filename}")
                         with open(md_filename, "w", encoding="utf-8") as f:
-                            f.write(result["markdown_content"])
+                            f.write(markdown_content)
                         result["output_file"] = str(md_filename)
-                else:
-                    # 处理markdown和markdown_embedded模式
-                    markdown_type = ImageRefMode.EMBEDDED if return_type == "markdown_embedded" else ImageRefMode.REFERENCED
-                    logger.info(f"导出Markdown，类型: {return_type}")
-                    markdown_content = res.document.export_to_markdown(image_mode=markdown_type)
-                    
-                    # 构建基本结果
-                    result = {
-                        "document_id": document_id,
-                        "markdown_content": markdown_content,
-                        "output_file": None
-                    }
-                    
-                    # 如果要输出到文件
-                    if output_dir:
-                        output_path = Path(output_dir)
-                        # 判断是文件还是目录
-                        if output_path.suffix:  # 有后缀名，当作文件处理
-                            output_path.parent.mkdir(parents=True, exist_ok=True)
-                            logger.info(f"保存Markdown到文件: {output_path}")
-                            with open(output_path, "w", encoding="utf-8") as f:
-                                f.write(markdown_content)
-                            result["output_file"] = str(output_path)
-                        else:  # 无后缀，当作目录处理
-                            output_path.mkdir(parents=True, exist_ok=True)
-                            doc_filename = Path(res.input.file).stem
-                            md_filename = output_path / f"{doc_filename}.md"
-                            logger.info(f"保存Markdown到文件: {md_filename}")
-                            with open(md_filename, "w", encoding="utf-8") as f:
-                                f.write(markdown_content)
-                            result["output_file"] = str(md_filename)
+                        
+                        # 如果有图片并且需要返回base64数据，保存到文件系统
+                        if return_base64_images and result["images"]:
+                            artifacts_dir = output_path / f"{doc_filename}_artifacts"
+                            artifacts_dir.mkdir(exist_ok=True)
+                            for ref_id, image_info in result["images"].items():
+                                if "base64" in image_info:
+                                    # 使用标准化的文件名
+                                    img_path = artifacts_dir / image_info["filename"]
+                                    with open(img_path, "wb") as f:
+                                        f.write(base64.b64decode(image_info["base64"]))
             
-            # 添加模型信息到结果中
-            result["model_info"] = model_info
             logger.info(f"处理完成，文档ID: {document_id}")
             
             return result
@@ -404,13 +475,24 @@ def get_vlm_converter(
     )
 
 def extract_images_with_markdown(conv_res, output_dir=None):
-    """提取文档中的插图和Markdown内容"""
+    """提取文档中的插图、描述和Markdown内容"""
     result = {
         "markdown_content": "",
-        "images": {}
+        "images": {},
+        "picture_descriptions": {}  # 新增字段存储图片描述
     }
     
     doc_filename = Path(conv_res.input.file).stem
+    
+    # 提取图片描述
+    for element, _level in conv_res.document.iterate_items():
+        if isinstance(element, PictureItem) and hasattr(element, "annotations") and element.annotations:
+            # 使用图片引用ID作为键
+            ref_id = element.self_ref
+            result["picture_descriptions"][ref_id] = {
+                "caption": element.caption_text(doc=conv_res.document),
+                "annotations": element.annotations
+            }
     
     # 如果需要保存到本地
     if output_dir:
@@ -492,3 +574,20 @@ def get_fast_pdf_converter(input_file):
     except Exception as e:
         logger.exception(f"PyPDF2快速提取失败: {str(e)}")
         raise
+
+# 获取OCR引擎的真实默认值（在获取PDF转换器之前）
+def get_default_ocr_engine():
+    """获取默认OCR引擎名称"""
+    return "rapid"  # 或者根据实际情况返回
+
+# 获取VLM模型的真实默认值
+def get_default_vlm_model(provider):
+    """根据提供商获取默认VLM模型名称"""
+    if provider == "ollama":
+        return "granite3.2-vision:2b"
+    elif provider == "dashscope":
+        return "qwen-vl-plus"
+    elif provider == "openai":
+        return "gpt-4o"
+    else:
+        return "HuggingFaceTB/SmolVLM-256M-Instruct"

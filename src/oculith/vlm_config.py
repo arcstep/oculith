@@ -16,6 +16,7 @@ from docling.datamodel.pipeline_options import (
     ResponseFormat,  # 导入枚举
     VlmPipelineOptions,
     InferenceFramework,
+    PictureDescriptionApiOptions,
 )
 from dotenv import load_dotenv, find_dotenv
 
@@ -270,3 +271,67 @@ def get_vlm_pipeline_options(
             raise ValueError(f"不支持的视觉模型提供商: {provider}")
     
     return pipeline_options
+
+def get_picture_description_api_options(
+    provider: str = None,
+    model: str = None, 
+    prompt: str = None
+) -> PictureDescriptionApiOptions:
+    """获取用于图片描述的API选项"""
+    # 从环境变量获取默认值
+    provider = provider or os.environ.get("VLM_PROVIDER", "ollama").lower()
+    model_name = model or os.environ.get("VLM_MODEL_NAME", "")
+    prompt_text = prompt or os.environ.get("VLM_PROMPT", "描述这个图像的内容。")
+    api_key = os.environ.get("VLM_API_KEY", "")
+    
+    # 确保model_name不为空，对每个提供商使用适当的默认值
+    if not model_name or not model_name.strip():
+        if provider == "ollama":
+            model_name = "granite3.2-vision:2b"
+        elif provider == "dashscope":
+            model_name = "qwen-vl-plus"
+        elif provider == "openai":
+            model_name = "gpt-4o"
+        else:
+            model_name = "HuggingFaceTB/SmolVLM-256M-Instruct"
+    
+    logger.info(f"使用VLM图片描述: 提供商={provider}, 模型={model_name}")
+    
+    # 根据提供商直接创建选项，确保model参数始终存在
+    if provider == "ollama":
+        api_options = PictureDescriptionApiOptions(
+            url="http://localhost:11434/v1/chat/completions",
+            params={"model": model_name},  # 明确设置model参数
+            prompt=prompt_text,
+            timeout=90,
+            kind="api"
+        )
+    elif provider == "dashscope" and api_key:
+        api_options = PictureDescriptionApiOptions(
+            url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            params={"model": model_name},  # 明确设置model参数
+            headers={"Authorization": f"Bearer {api_key}"},
+            prompt=prompt_text,
+            timeout=90,
+            kind="api"
+        )
+    elif provider == "openai" and api_key:
+        api_options = PictureDescriptionApiOptions(
+            url="https://api.openai.com/v1/chat/completions",
+            params={"model": model_name},  # 明确设置model参数
+            headers={"Authorization": f"Bearer {api_key}"},
+            prompt=prompt_text,
+            timeout=90,
+            kind="api"
+        )
+    else:
+        # 默认本地服务配置
+        api_options = PictureDescriptionApiOptions(
+            url="http://localhost:8000/v1/chat/completions",
+            params={"model": model_name},  # 明确设置model参数
+            prompt=prompt_text,
+            timeout=90,
+            kind="api"
+        )
+    
+    return api_options

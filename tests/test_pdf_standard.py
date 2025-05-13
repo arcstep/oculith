@@ -47,7 +47,7 @@ def test_pdf_with_images():
         content_type="file",
         pipeline="standard",
         generate_images="picture",  # 提取图片
-        return_type="dict_with_images",
+        return_base64_images=True,  # 新参数，替代 return_type="dict_with_images"
         output_dir=str(output_dir)
     )
     
@@ -71,7 +71,36 @@ def test_pdf_image_scaling(image_scale):
         pipeline="standard",
         generate_images="picture",
         images_scale=image_scale,
-        return_type="dict_with_images"
+        return_base64_images=True  # 新参数，替代 return_type="dict_with_images"
     )
     
     assert "images" in result
+
+def test_standard_pipeline_with_vlm():
+    """测试标准管道与VLM图片描述功能的组合"""
+    # 选择包含图片的PDF测试文件
+    pdf_file = Path("tests/data/pdf/picture_classification.pdf")
+    if not pdf_file.exists():
+        pytest.skip(f"测试文件 {pdf_file} 不存在")
+    
+    output_dir = OUTPUT_DIR / "standard_with_vlm"
+    output_dir.mkdir(exist_ok=True)
+    
+    # 对于测试目的，将测试标记为跳过如果没有配置VLM环境
+    try:
+        # 使用标准管道启用VLM图片描述
+        result = convert(
+            content=str(pdf_file),
+            content_type="file",
+            pipeline="standard",
+            generate_images="picture",
+            return_base64_images=True,  # 新参数，替代 return_type="dict_with_images"
+            output_dir=str(output_dir),
+            enable_vlm_picture_description=True
+        )
+        
+        assert "error" not in result, f"转换错误: {result.get('message', '')}"
+        assert result["model_info"]["pipeline"] == "standard"
+        assert result["model_info"]["vlm_enabled"] is True
+    except Exception as e:
+        pytest.skip(f"VLM测试失败，可能是缺少运行环境: {e}")
