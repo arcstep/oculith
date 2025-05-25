@@ -12,27 +12,7 @@ import io
 import time
 from pypdf import PdfReader
 
-# 1. 开启 MPS 回退，禁用 CUDA
-os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-
-# 2. 强制 docling_ibm_models 中的 CodeFormulaPredictor 全程使用 CPU
-try:
-    from docling_ibm_models.code_formula_model.code_formula_predictor import CodeFormulaPredictor
-    _orig_predict = CodeFormulaPredictor.predict
-    def _cpu_only_predict(self, images, labels):
-        # 把模型和运算都移动到 CPU
-        self._device = 'cpu'
-        self._model.to('cpu')
-        return _orig_predict(self, images, labels)
-    CodeFormulaPredictor.predict = _cpu_only_predict
-except ImportError:
-    pass
-
-# 3. 之后再 import torch，确保以上环境变量和补丁已生效
-import torch
-# 将默认 device 全部设为 CPU
-torch.set_default_device('cpu')
+from .pytorch_patch import *
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -140,11 +120,7 @@ def convert(
         vlm_provider: VLM提供商(dashscope, ollama, openai, huggingface)
         vlm_model: VLM模型名称
         vlm_prompt: VLM提示词
-    """
-    if enable_formula_enrichment:
-        patch_mps_autocast()
-        logger.info("🔧 已修补MPS autocast兼容性问题")
-    
+    """    
     model_info = {
         "pipeline": pipeline,
         "provider": None,
@@ -889,38 +865,3 @@ def print_ocr_status():
     available_engines = [k for k, v in status.items() if v]
     print(f"✅ 可用引擎: {', '.join(available_engines)}")
     print()
-
-def patch_mps_autocast():
-    """修补MPS设备的兼容性问题 - 强制公式理解使用CPU"""
-    import os
-    
-    # 1. 强制整个进程的公式理解部分使用CPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 禁用CUDA
-    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-    
-    # 2. 修补torch默认设备
-    original_set_default_device = torch.set_default_device
-    
-    def patched_set_default_device(device):
-        if str(device) == 'mps':
-            logger.warning("🔧 检测到MPS设备设置，为兼容性改为CPU")
-            return original_set_default_device('cpu')
-        return original_set_default_device(device)
-    
-    torch.set_default_device = patched_set_default_device
-    
-    # 3. 修补autocast
-    original_autocast = torch.autocast
-    
-    def patched_autocast(device_type, **kwargs):
-        if device_type == 'mps':
-            logger.warning("🔧 MPS设备不支持autocast，强制使用CPU")
-            return original_autocast('cpu', **kwargs)
-        return original_autocast(device_type, **kwargs)
-    
-    torch.autocast = patched_autocast
-    
-    # 4. 强制设置默认张量类型为CPU
-    torch.set_default_tensor_type(torch.FloatTensor)
-    
-    logger.info("🔧 已强制公式理解组件使用CPU以确保兼容性")
