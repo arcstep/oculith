@@ -2,6 +2,7 @@ import os
 import sys
 import hashlib
 import logging
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, Literal
 import json
@@ -10,6 +11,28 @@ from docling_core.types.doc import ImageRefMode, PictureItem
 import io
 import time
 from pypdf import PdfReader
+
+# 1. 开启 MPS 回退，禁用 CUDA
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+# 2. 强制 docling_ibm_models 中的 CodeFormulaPredictor 全程使用 CPU
+try:
+    from docling_ibm_models.code_formula_model.code_formula_predictor import CodeFormulaPredictor
+    _orig_predict = CodeFormulaPredictor.predict
+    def _cpu_only_predict(self, images, labels):
+        # 把模型和运算都移动到 CPU
+        self._device = 'cpu'
+        self._model.to('cpu')
+        return _orig_predict(self, images, labels)
+    CodeFormulaPredictor.predict = _cpu_only_predict
+except ImportError:
+    pass
+
+# 3. 之后再 import torch，确保以上环境变量和补丁已生效
+import torch
+# 将默认 device 全部设为 CPU
+torch.set_default_device('cpu')
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
@@ -27,8 +50,53 @@ from .vlm_config import get_vlm_pipeline_options
 
 logger = logging.getLogger(__name__)
 
+# 🔧 Monkey patch for tokenizer compatibility
+def _apply_tokenizer_patch():
+    """应用tokenizer兼容性补丁"""
+    try:
+        from transformers import AutoTokenizer
+        
+        # 只在第一次导入时应用补丁
+        if not hasattr(AutoTokenizer, '_oculith_patched'):
+            # 保存原始方法
+            original_from_pretrained = AutoTokenizer.from_pretrained
+            
+            @classmethod
+            def patched_from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+                """强制使用慢速tokenizer解决ModelWrapper兼容性问题"""
+                # 对公式模型强制使用慢速tokenizer
+                if 'CodeFormula' in str(pretrained_model_name_or_path):
+                    kwargs['use_fast'] = False
+                    logger.debug(f"应用tokenizer补丁: {pretrained_model_name_or_path}")
+                
+                return original_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+            
+            # 替换方法并标记已补丁
+            AutoTokenizer.from_pretrained = patched_from_pretrained
+            AutoTokenizer._oculith_patched = True
+            logger.debug("✅ Tokenizer兼容性补丁已应用")
+            
+    except ImportError:
+        # transformers未安装时忽略
+        pass
+
+# 应用补丁
+_apply_tokenizer_patch()
+
+
 # 创建Celery应用
 app = create_app("docling")
+
+def sanitize_filename(filename: str) -> str:
+    """将字符串转换为安全的文件名"""
+    # 移除或替换不安全的字符
+    safe_name = re.sub(r'[<>:"/\\|?*#]', '_', filename)
+    # 移除开头和结尾的点和空格
+    safe_name = safe_name.strip('. ')
+    # 确保不为空
+    if not safe_name:
+        safe_name = "unnamed"
+    return safe_name
 
 @app.task(name="docling.convert")
 def convert(
@@ -42,9 +110,11 @@ def convert(
     return_base64_images: bool = False,
     images_scale: float = 2.0,
     generate_images: Literal["none", "page", "picture", "all"] = "picture",
-    advanced_features: Optional[Dict[str, bool]] = None,
     output_dir: Optional[str] = None,
     enable_vlm_picture_description: bool = False,
+    enable_picture_classification: bool = False,
+    enable_formula_enrichment: bool = True,
+    enable_code_enrichment: bool = True,
     vlm_provider: Optional[str] = None,
     vlm_model: Optional[str] = None,
     vlm_prompt: Optional[str] = None,
@@ -62,13 +132,19 @@ def convert(
         return_base64_images: 是否返回图片的base64编码数据
         images_scale: 图像缩放比例
         generate_images: 图像生成控制
-        advanced_features: 高级特性控制
         output_dir: 输出文件路径
         enable_vlm_picture_description: 是否启用VLM图片描述功能
+        enable_formula_enrichment: 是否启用公式理解功能
+        enable_picture_classification: 是否启用图片分类功能
+        enable_code_enrichment: 是否启用代码理解功能
         vlm_provider: VLM提供商(dashscope, ollama, openai, huggingface)
         vlm_model: VLM模型名称
         vlm_prompt: VLM提示词
     """
+    if enable_formula_enrichment:
+        patch_mps_autocast()
+        logger.info("🔧 已修补MPS autocast兼容性问题")
+    
     model_info = {
         "pipeline": pipeline,
         "provider": None,
@@ -116,13 +192,7 @@ def convert(
                 elif generate_images == "all":
                     pipeline_options.generate_page_images = True
                     pipeline_options.generate_picture_images = True
-                
-                # 应用高级特性
-                if advanced_features:
-                    for feature, enabled in advanced_features.items():
-                        if hasattr(pipeline_options, feature):
-                            setattr(pipeline_options, feature, enabled)
-                
+                                
                 # 如果启用VLM图片描述功能
                 if enable_vlm_picture_description:
                     # 启用远程服务和图片描述
@@ -162,14 +232,56 @@ def convert(
                 
                 # 直接使用配置好的选项创建新的转换器
                 logger.info(f"创建PDF转换器，OCR引擎: {ocr}, 语言: {language}")
-                converter = get_pdf_converter(
-                    ocr=ocr, 
-                    language=language, 
-                    pipeline_options=pipeline_options
-                )
+                
+                # 🔍 提前检查OCR引擎可用性，给用户友好提示
+                try:
+                    converter = get_pdf_converter(
+                        ocr=ocr, 
+                        language=language, 
+                        pipeline_options=pipeline_options
+                    )
+                except ValueError as e:
+                    # OCR引擎不可用，返回友好错误
+                    return {
+                        "error": True,
+                        "message": str(e),
+                        "error_type": "OCREngineNotAvailable",
+                        "suggestion": "请根据安装指导安装相应的OCR引擎，或使用其他可用引擎",
+                        "model_info": model_info
+                    }
                 model_info["ocr_engine"] = ocr or "默认"
                 model_info["pipeline"] = "standard"
                 
+                # 🔥 根据官方文档的简单方法：
+                
+                # 1. 公式理解
+                if enable_formula_enrichment:
+                    try:
+                        pipeline_options.do_formula_enrichment = True
+                        logger.info("✅ 启用官方公式理解功能")
+                        model_info["formula_enrichment"] = True
+                    except Exception as e:
+                        logger.error(f"公式理解启用失败: {e}")
+                        # 可以选择返回错误或继续处理
+                
+                # 2. 图片分类
+                if enable_picture_classification:
+                    try:
+                        pipeline_options.do_picture_classification = True
+                        logger.info("✅ 启用图片分类功能")
+                        model_info["picture_classification"] = True
+                    except Exception as e:
+                        logger.error(f"图片分类启用失败: {e}")
+                
+                # 3. 代码理解（也可以添加）
+                if enable_code_enrichment:
+                    try:
+                        pipeline_options.do_code_enrichment = True
+                        logger.info("✅ 启用代码理解功能")
+                        model_info["code_enrichment"] = True
+                    except Exception as e:
+                        logger.error(f"代码理解启用失败: {e}")
+            
             elif pipeline == "simple":
                 ext = Path(temp_file_path).suffix.lower()[1:] if Path(temp_file_path).suffix else file_type
                 
@@ -286,10 +398,12 @@ def convert(
                             logger.info(f"图片没有注释")
                         
                         # 无论是否需要base64数据，都添加到返回结果中
+                        safe_ref_id = sanitize_filename(ref_id)  # 安全化文件名
                         image_info = {
-                            "filename": f"{ref_id}.png",
-                            "ref_path": f"{doc_filename}_artifacts/{ref_id}.png",
-                            "caption": caption
+                            "filename": f"{safe_ref_id}.png",
+                            "ref_path": f"{doc_filename}_artifacts/{safe_ref_id}.png",
+                            "caption": caption,
+                            "original_ref": ref_id  # 保留原始引用
                         }
                         
                         # 如果有图片注释，则返回
@@ -351,8 +465,9 @@ def convert(
                             artifacts_dir.mkdir(exist_ok=True)
                             for ref_id, image_info in result["images"].items():
                                 if "base64" in image_info:
-                                    # 使用标准化的文件名
+                                    # 使用安全化的文件名
                                     img_path = artifacts_dir / image_info["filename"]
+                                    logger.info(f"保存图片: {img_path}")
                                     with open(img_path, "wb") as f:
                                         f.write(base64.b64decode(image_info["base64"]))
             
@@ -377,9 +492,158 @@ def convert(
             "model_info": model_info  # 在错误情况下也返回模型信息
         }
 
+def check_ocr_engine_availability(ocr_engine: str) -> tuple[bool, str]:
+    """检查OCR引擎是否可用
+    
+    Returns:
+        tuple: (是否可用, 错误信息或安装指导)
+    """
+    if not ocr_engine or ocr_engine == "rapid":
+        # RapidOCR是docling内置的，但也要测试一下
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            # 尝试创建实例来确保能正常工作
+            ocr = RapidOCR()
+            return True, ""
+        except Exception as e:
+            return False, f"❌ RapidOCR初始化失败: {e}\n🔧 可能需要重新安装docling"
+    
+    try:
+        if ocr_engine == "tesseract":
+            # 1. 检查Python包
+            import tesserocr
+            
+            # 2. 检查系统命令
+            import shutil
+            tesseract_path = shutil.which("tesseract")
+            if not tesseract_path:
+                return False, (
+                    "❌ Tesseract系统命令未找到\n"
+                    "🔧 安装方法：\n"
+                    "   brew install tesseract tesseract-lang\n"
+                    "   export TESSDATA_PREFIX=/opt/homebrew/share/tessdata/"
+                )
+            
+            # 3. 检查架构兼容性
+            import subprocess
+            try:
+                result = subprocess.run([tesseract_path, "--version"], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    return False, (
+                        f"❌ Tesseract命令执行失败: {result.stderr}\n"
+                        "🔧 可能是架构不兼容，尝试重新安装:\n"
+                        "   brew uninstall tesseract\n"
+                        "   brew install tesseract tesseract-lang"
+                    )
+            except subprocess.TimeoutExpired:
+                return False, "❌ Tesseract命令超时，可能存在架构问题"
+            
+            # 4. 测试TesserOCR初始化
+            try:
+                tesserocr.PyTessBaseAPI()
+                return True, ""
+            except Exception as e:
+                return False, (
+                    f"❌ TesserOCR初始化失败: {e}\n"
+                    "🔧 可能是架构不兼容或语言数据缺失，尝试:\n"
+                    "   1. 重新安装: brew reinstall tesseract tesseract-lang\n"
+                    "   2. 重新编译Python包: poetry install --no-cache"
+                )
+            
+        elif ocr_engine == "easy":
+            # 1. 检查导入
+            import easyocr
+            
+            # 2. 测试初始化（这会下载模型）
+            try:
+                reader = easyocr.Reader(['ch_sim', 'en'], gpu=False)
+                return True, ""
+            except Exception as e:
+                return False, (
+                    f"❌ EasyOCR初始化失败: {e}\n"
+                    "🔧 可能需要重新安装:\n"
+                    "   poetry remove easyocr\n"
+                    "   poetry add easyocr"
+                )
+            
+        elif ocr_engine == "mac":
+            # 1. 检查系统
+            import platform
+            if platform.system() != "Darwin":
+                return False, (
+                    "❌ OcrMac只能在macOS系统上使用\n"
+                    "🔧 建议使用其他OCR引擎：rapid, tesseract, easy"
+                )
+            
+            # 2. 检查导入
+            import ocrmac
+            
+            # 3. 测试功能
+            try:
+                # 测试是否能访问系统OCR服务
+                ocrmac.OCR("test").recognize("dummy")
+                return True, ""
+            except Exception as e:
+                # 这里可能会失败，但只要能导入就算成功
+                return True, ""
+            
+        else:
+            return False, f"❌ 未知的OCR引擎: {ocr_engine}"
+            
+    except ImportError as e:
+        missing_package = str(e).split("'")[1] if "'" in str(e) else ocr_engine
+        
+        # 针对从Intel迁移的情况给出特别说明
+        migration_note = (
+            "\n⚠️  从Intel Mac迁移的用户注意：\n"
+            "   可能需要完全重新安装依赖以适配Apple Silicon架构"
+        )
+        
+        install_guides = {
+            "tesserocr": (
+                "❌ TesserOCR未安装或架构不兼容\n"
+                "🔧 安装方法：\n"
+                "   1. 安装系统依赖: brew install tesseract tesseract-lang\n"
+                "   2. 设置环境变量: export TESSDATA_PREFIX=/opt/homebrew/share/tessdata/\n"
+                "   3. 重新安装Python包: poetry install --no-cache"
+                + migration_note
+            ),
+            "easyocr": (
+                "❌ EasyOCR未安装\n"
+                "🔧 安装方法：\n"
+                "   poetry add easyocr"
+                + migration_note
+            ),
+            "ocrmac": (
+                "❌ OcrMac未安装\n"
+                "🔧 安装方法：\n"
+                "   poetry install --no-cache"
+                + migration_note
+            )
+        }
+        
+        guide = install_guides.get(missing_package, f"❌ 缺少依赖包: {missing_package}")
+        return False, guide
+    
+    except Exception as e:
+        return False, (
+            f"❌ {ocr_engine} 引擎测试失败: {e}\n"
+            "🔧 可能是架构不兼容，建议重新安装相关依赖"
+        )
+
 def get_pdf_converter(ocr: Optional[str] = None, language: str = "zh", 
                      pipeline_options: Optional[PdfPipelineOptions] = None) -> DocumentConverter:
     """获取PDF处理转换器"""
+    
+    # 🔍 检查OCR引擎可用性
+    if ocr:
+        available, error_message = check_ocr_engine_availability(ocr)
+        if not available:
+            logger.error(f"OCR引擎 '{ocr}' 不可用:")
+            logger.error(error_message)
+            raise ValueError(f"OCR引擎 '{ocr}' 不可用。\n\n{error_message}")
+    
     # 如果没有提供选项，创建默认选项
     if pipeline_options is None:
         pipeline_options = PdfPipelineOptions()
@@ -390,6 +654,7 @@ def get_pdf_converter(ocr: Optional[str] = None, language: str = "zh",
     # 如果指定OCR，配置OCR选项
     if ocr:
         pipeline_options.do_ocr = True
+        logger.info(f"✅ 使用OCR引擎: {ocr}")
         
         # 配置OCR选项
         if ocr == "rapid":
@@ -591,3 +856,71 @@ def get_default_vlm_model(provider):
         return "gpt-4o"
     else:
         return "HuggingFaceTB/SmolVLM-256M-Instruct"
+
+# 添加一个辅助函数来列出可用的OCR引擎
+def list_available_ocr_engines() -> Dict[str, bool]:
+    """列出所有OCR引擎的可用性状态"""
+    engines = ["rapid", "tesseract", "easy", "mac"]
+    status = {}
+    
+    for engine in engines:
+        available, _ = check_ocr_engine_availability(engine)
+        status[engine] = available
+    
+    return status
+
+def print_ocr_status():
+    """打印OCR引擎状态报告"""
+    status = list_available_ocr_engines()
+    
+    print("\n🔍 OCR引擎可用性检查:")
+    print("=" * 40)
+    
+    for engine, available in status.items():
+        status_icon = "✅" if available else "❌"
+        status_text = "可用" if available else "不可用"
+        print(f"  {status_icon} {engine:<12} {status_text}")
+        
+        if not available:
+            _, guide = check_ocr_engine_availability(engine)
+            print(f"     安装指导: {guide.split('🔧')[1].strip() if '🔧' in guide else guide}")
+    
+    print("=" * 40)
+    available_engines = [k for k, v in status.items() if v]
+    print(f"✅ 可用引擎: {', '.join(available_engines)}")
+    print()
+
+def patch_mps_autocast():
+    """修补MPS设备的兼容性问题 - 强制公式理解使用CPU"""
+    import os
+    
+    # 1. 强制整个进程的公式理解部分使用CPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 禁用CUDA
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+    
+    # 2. 修补torch默认设备
+    original_set_default_device = torch.set_default_device
+    
+    def patched_set_default_device(device):
+        if str(device) == 'mps':
+            logger.warning("🔧 检测到MPS设备设置，为兼容性改为CPU")
+            return original_set_default_device('cpu')
+        return original_set_default_device(device)
+    
+    torch.set_default_device = patched_set_default_device
+    
+    # 3. 修补autocast
+    original_autocast = torch.autocast
+    
+    def patched_autocast(device_type, **kwargs):
+        if device_type == 'mps':
+            logger.warning("🔧 MPS设备不支持autocast，强制使用CPU")
+            return original_autocast('cpu', **kwargs)
+        return original_autocast(device_type, **kwargs)
+    
+    torch.autocast = patched_autocast
+    
+    # 4. 强制设置默认张量类型为CPU
+    torch.set_default_tensor_type(torch.FloatTensor)
+    
+    logger.info("🔧 已强制公式理解组件使用CPU以确保兼容性")

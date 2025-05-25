@@ -163,3 +163,4 @@ cython_debug/
 output/
 
 docling/markdown/
+reinstall_ocr_engins.sh
